@@ -5,11 +5,12 @@ import linecache
 import struct
 import contextlib, subprocess
 from pprint import pprint
-from collections import namedtuple, OrderedDict
+import collections
 import logging
+from functools import partial
 from logging import warning, debug
 
-MemMap = namedtuple("MemMap", "start end perms offset dev inode filename")
+MemMap = collections.namedtuple("MemMap", "start end perms offset dev inode filename")
 
 PAGE_SIZE = 4096
 INTERP_HEAD_OFFSET = 0x90b0
@@ -30,7 +31,6 @@ class MemReader(object):
         self._fh.close()
         self._fh = None
 
-    # 0 1| 2 3| 4 5
     def read(self, start, end):
         real_start = int(start / PAGE_SIZE) * PAGE_SIZE
         real_end = int((end + (PAGE_SIZE - 1)) / PAGE_SIZE) * PAGE_SIZE
@@ -48,74 +48,197 @@ class MemReader(object):
         return self.read(item[0], item[1])
 
 
-class Struct(object):
-    format = None
-
-    def __new__(cls, *args, **kwargs):
-        return args[0]
-
-    @classmethod
-    def calcsize(cls):
-        return struct.calcsize(cls.format)
-
-    @classmethod
-    def unpack(cls, val):
-        return struct.unpack(cls.format, val)[0]
-
-class ULong(Struct):
-    format = '<Q'
-
-class Long(Struct):
-    format = '<q'
-
-class Int(Struct):
-    format = '<i'
-
-class Char(Struct):
-    format = 'c'
-
-def Stub(length):
-    class CharArr(Struct):
-        format = 'c' * length
-    return [None, CharArr]
-
-def PtrTo(cls):
-    class Dummmy(VoidPtr):
-        def get_size(self):
-            return cls.calcsize()
-
-        def from_mem(self, c):
-            return cls.unpack(c)
-
-    return type(cls.__name__ + 'Ptr', (VoidPtr,), dict(Dummmy.__dict__))
-
-class VoidPtr(Struct):
-    format = '<Q'
-
-    def __nonzero__(self):
-        return self._addr != 0
-
-    def __new__(cls, *args, **kwargs):
-        return object.__new__(cls, *args, **kwargs)
-
-    def __init__(self, addr, mr):
-        self._mr = mr
+class Structured(object):
+    """Chunk of memory of some (probably not constant - TODO) size that can be unpacked into some object or structure"""
+    def __init__(self, addr, mem, user_value=None, *args, **kwargs):
+        super(Structured, self).__init__(*args, **kwargs)
+        if not ((addr is not None) ^ (user_value is not None)):
+            raise TypeError("You must specify either addr or value")
+        # Let's simplify life by this innocent hack
+        # XXX: Pointer to pointers? what to do?
+        if isinstance(addr, Primitive):
+            addr = addr._value
         self._addr = addr
+        self._mem = mem
+        self._user_value = user_value
 
-    def from_mem(self, c):
-        return c
+    def __add__(self, other):
+        result = self.from_user_value(self._value, self._mem)
+        result += other
+        return result
+
+    def __iadd__(self, other):
+        raise NotImplementedError
+
+    @classmethod
+    def from_user_value(cls, val, mem):
+        return cls(addr=None, mem=mem, user_value=val)
+
+    @property
+    def _value(self):
+        if self._addr is not None:
+            result = self.read_from_mem()
+        else:
+            result = self._user_value
+        return result
+
+    @_value.setter
+    def _value(self, val):
+        if self._addr is not None:
+            raise ValueError("Can't modify memory")
+        self._user_value = val
 
     def get_size(self):
         raise NotImplementedError
 
-    def get_slice(self, start, stop):
-        start_byte = start * self.get_size()
-        stop_byte  = stop * self.get_size()
-        mem = self._mr[self._addr + start_byte: self._addr + stop_byte]
-        result = []
-        for i in xrange(0, stop_byte - start_byte, self.get_size()):
-            result.append(self.from_mem(mem[i: i + self.get_size()]))
+class Primitive(Structured):
+    """Single primitive object unpacked by struct.unpack"""
+    format = None
+
+    def __nonzero__(self):
+        return bool(self._value)
+
+    def read_from_mem(self):
+        val = self._mem[self._addr: self._addr + self.get_size()]
+        return struct.unpack(self.format, val)[0]
+
+    def get_size(self):
+        return struct.calcsize(self.format)
+
+    def __repr__(self):
+        return '%s(addr=%s)' % (self.__class__.__name__, self._addr)
+
+def create_Primitive(name, format):
+    return type(name, (Primitive,), {'format': format})
+
+for name, format in {
+    'ULong': '<Q',
+    'Long': '<q',
+    'UInt': '<I',
+    'Int': '<i',
+    'Char': 'c',
+    }.iteritems():
+    globals()[name] = create_Primitive(name, format)
+
+class Compound(Structured, collections.Mapping):
+    @property
+    def _fields(self):
+        return self._value
+
+    def __getitem__(self, item):
+        result = self._fields[item]
+        if isinstance(result, Primitive) and not isinstance(result, Ptr):
+            result = result._value
         return result
+
+    def __iter__(self):
+        return iter(self._fields)
+
+    def __len__(self):
+        return len(self._fields)
+
+    def __getattr__(self, attr):
+        try:
+            result = self[attr]
+        except KeyError:
+            raise AttributeError(attr)
+        return result
+
+    @classmethod
+    def get_fields(cls):
+        # [['field', type]]
+        return []
+
+    def parse_fields(self):
+        offset = 0
+        for field_name, field_type in self.get_fields():
+            field = field_type(self._addr + offset, self._mem)
+            if field_name is not None:
+                yield field_name, field
+            offset += field.get_size()
+
+    def get_size(self):
+        result = 0
+        for field_name, field in self.parse_fields():
+            result += field.get_size()
+        return result
+
+    def read_from_mem(self):
+        return collections.OrderedDict(self.parse_fields())
+
+    def offset_of(self, name):
+        for field_name, field in self.parse_fields():
+            if field_name == name:
+                return field._addr - self._addr
+        else:
+            raise KeyError(field)
+
+
+# def Stub(length):
+#     class CharArr(Struct):
+#         format = 'c' * length
+#     return [None, CharArr]
+
+class Array(Compound):
+    value_type = None
+    size = 0
+    @classmethod
+    def get_fields(cls):
+        return [[i, cls.value_type] for i in xrange(cls.size)]
+
+    def read_from_mem(self):
+        ordered_dct = super(ArrayOf, self).read_from_mem()
+        for i in xrange(len(ordered_dct)):
+            result.append(ordered_dct[i])
+        return result
+
+def ArrayOf(value_type, size):
+    return type(
+        value_type.__name__ + 'Arr', (Array,),
+        dict(value_type=value_type, size=size))
+
+def Stub(size):
+    return [None, ArrayOf(Char, size)]
+
+def PtrTo(value_type):
+    return type(value_type.__name__ + 'Ptr',
+               (Ptr,), dict(value_type=value_type))
+
+class Ptr(ULong):
+    value_type = None
+
+    @property
+    def _ptr(self):
+        """Address where Ptr points to"""
+        return self._value
+
+    def deref(self):
+        value_field = self.deref_field()
+        if issubclass(self.value_type, Primitive) and not isinstance(self.value_type, Ptr):
+            result = value_field._value
+        else:
+            result = value_field
+        return result
+
+    def deref_field(self):
+        return self.value_type(self._value, self._mem)
+
+    def __iadd__(self, other):
+        if isinstance(other, Ptr):
+            adding = other._value
+        else:
+            adding = other * self.deref_field().get_size()
+        self._value += adding
+        return self
+
+    def get_slice_fields(self, start, stop):
+        result = []
+        for i in xrange(start, stop):
+            result.append((self + i).deref_field())
+        return result
+
+    def get_slice(self, start, stop):
+        return [field._value for field in self.get_slice_fields(start, stop)]
 
     def __getitem__(self, item):
         start = stop = None
@@ -129,81 +252,21 @@ class VoidPtr(Struct):
             raise ValueError("Right bound must be closed")
         return self.get_slice(start, stop)
 
-    def __repr__(self):
-        return "<%s(addr=%x)" % (self.__class__.__name__, self._addr)
+class VoidPtrDereference(Exception):
+    """Someone tried to dereference a void pointer"""
 
-class CharPtr(PtrTo(Char)):
+class VoidPtr(Ptr):
+    def deref(self):
+        raise VoidPtrDereference(self)
+
+class CharPtr(Ptr):
+    value_type = Char
     def get_slice(self, start, stop):
         return ''.join(super(CharPtr, self).get_slice(start, stop))
 
 ULongPtr = PtrTo(ULong)
 
-class StructPtr(VoidPtr):
-    addrs_being_represented = set()
-    def get_fields(self):
-        raise NotImplementedError
-
-    def alt_repr(self):
-        raise NotImplementedError
-
-    def __repr__(self):
-        print "Representing %s, addr %x" % (self.__class__.__name__, self._addr)
-        if not self._addr:
-            return '<%s(NULL)>' % self.__class__.__name__
-        else:
-            try:
-                return self.alt_repr()
-            except NotImplementedError:
-                pass
-            except IOError:
-                pass
-        try:
-            fields = self[0]
-        except IOError:
-            fields_repr = '(unreadable)'
-        else:
-            my_key = (type(self), self._addr)
-            if my_key in self.addrs_being_represented:
-                fields_repr = '(loop)'
-            else:
-                try:
-                    self.addrs_being_represented.add(my_key)
-                    for name, field in fields.iteritems():
-                        print "REPRESENTING", name
-                        if hasattr(field, '_addr'):
-                            print "ADDR", hex(field._addr)
-                        repr(field)
-                    fields_repr = "repr(fields)"
-                finally:
-                    self.addrs_being_represented.discard(my_key)
-        return "<%s(addr=%x, %s)" % (self.__class__.__name__, self._addr, fields_repr)
-
-    def get_size(self):
-        result = 0
-        for name, field in self.get_fields():
-            result += field.calcsize()
-        return result
-
-    def offset_of(self, field_name):
-        result = 0
-        for name, fld in self.get_fields():
-            if name == field_name:
-                break
-            result += fld.calcsize()
-        else:
-            raise KeyError(field)
-        return result
-
-    def from_mem(self, c):
-        result = OrderedDict()
-        for name, field in self.get_fields():
-            sz = field.calcsize()
-            value, c = field.unpack(c[:sz]), c[sz:]
-            if name is not None:
-                result[name] = field(value, self._mr)
-        return result
-
-class PyInterpreterStatePtr(StructPtr):
+class PyInterpreterState(Compound):
     def get_fields(self):
         return [
             ['next', PyInterpreterStatePtr],
@@ -217,8 +280,9 @@ class PyInterpreterStatePtr(StructPtr):
             ['codec_error_registry', PyObjectPtr],
         ]
 
+PyInterpreterStatePtr = PtrTo(PyInterpreterState)
 
-class PyThreadStatePtr(StructPtr):
+class PyThreadState(Compound):
     def get_fields(self):
         return [
             ['next', PyThreadStatePtr],
@@ -246,24 +310,30 @@ class PyThreadStatePtr(StructPtr):
             ['trash_delete_later', PyObjectPtr],
         ]
 
+PyThreadStatePtr = PtrTo(PyThreadState)
+
 PyTypeObjectPtr = VoidPtr
 
-class PyObjectPtr(StructPtr):
+class PyObject(Compound):
     def get_fields(self):
         return [
             ['ob_refcnt', ULong],
             ['ob_type', PyTypeObjectPtr]
         ]
 
-class PyVarObjectPtr(PyObjectPtr):
+PyObjectPtr = PtrTo(PyObject)
+
+class PyVarObject(PyObject):
     def get_fields(self):
-        return super(PyVarObjectPtr, self).get_fields() + [
+        return super(PyVarObject, self).get_fields() + [
             ['ob_size', ULong]
         ]
 
-class PyFrameObjectPtr(PyVarObjectPtr):
+PyVarObjectPtr = PtrTo(PyVarObject)
+
+class PyFrameObject(PyVarObject):
     def get_fields(self):
-        return super(PyFrameObjectPtr, self).get_fields() + [
+        return super(PyFrameObject, self).get_fields() + [
             ['f_back', PyFrameObjectPtr],
             ['f_code', PyCodeObjectPtr],
             ['f_builtins', PyObjectPtr],
@@ -282,24 +352,26 @@ class PyFrameObjectPtr(PyVarObjectPtr):
             # XXX: Other stuff goes here, but me too lazy
         ]
 
-class PyStringObjectPtr(PyVarObjectPtr):
+PyFrameObjectPtr = PtrTo(PyFrameObject)
+
+class PyStringObject(PyVarObject):
     def get_fields(self):
-        return super(PyStringObjectPtr, self).get_fields() + [
+        return super(PyStringObject, self).get_fields() + [
             ['ob_shash', Long],
             ['ob_sstate', Int],
             ['ob_sval', Char]
         ]
 
-    def alt_repr(self):
-        return repr(self.to_string())
-
     def to_string(self):
-        size = self[0]['ob_size']
-        return CharPtr(self._addr + self.offset_of('ob_sval'), self._mr)[:size]
+        return CharPtr.from_user_value(
+            self._addr + self.offset_of('ob_sval'), self._mem
+        )[:self.ob_size]
 
-class PyCodeObjectPtr(PyObjectPtr):
+PyStringObjectPtr = PtrTo(PyStringObject)
+
+class PyCodeObject(PyObject):
     def get_fields(self):
-        return super(PyCodeObjectPtr, self).get_fields() + [
+        return super(PyCodeObject, self).get_fields() + [
             ['co_argcount', Int],
             ['co_nlocals', Int],
             ['co_stacksize', Int],
@@ -317,6 +389,8 @@ class PyCodeObjectPtr(PyObjectPtr):
             ['co_lnotab', PyStringObjectPtr],
             # Other uninteresting stuff
         ]
+
+PyCodeObjectPtr = PtrTo(PyCodeObject)
 
 """
 typedef struct {
@@ -404,11 +478,11 @@ def cmd_as_file(*args, **kwargs):
         p.wait()
 
 def format_frame(frame):
-    f_code = frame['f_code'][0]
-    co_filename = f_code['co_filename'].to_string()
+    f_code = frame['f_code'].deref()
+    co_filename = f_code['co_filename'].deref().to_string()
     co_firstlineno = f_code['co_firstlineno']
-    co_lnotab = f_code['co_lnotab'].to_string()
-    co_name = f_code['co_name'].to_string()
+    co_lnotab = f_code['co_lnotab'].deref().to_string()
+    co_name = f_code['co_name'].deref().to_string()
     line_no = PyCode_Addr2Line(co_lnotab, frame['f_lasti'], co_firstlineno)
     line = linecache.getline(co_filename, line_no)
     return '%s:%s(%d)\n%s' % (
@@ -418,8 +492,9 @@ def format_frame(frame):
 def format_stack(frame_ptr):
     result = []
     while frame_ptr:
-        result.append(format_frame(frame_ptr[0]))
-        frame_ptr = frame_ptr[0]['f_back']
+        frame = frame_ptr.deref()
+        result.append(format_frame(frame))
+        frame_ptr = frame['f_back']
     return result[::-1]
 
 def get_interp_head_through_libpython(pid):
@@ -480,6 +555,7 @@ def get_interp_head_through_PyInterpreterState_Head(pid):
 
 
 if __name__ == '__main__':
+
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument('pid', type=int)
@@ -499,13 +575,14 @@ if __name__ == '__main__':
     debug("interp_head location: %x", interp_head_addr)
 
     with MemReader(pid) as mr:
-        interp_state_addr = ULongPtr(interp_head_addr, mr)[0]
-        interp_state = PyInterpreterStatePtr(interp_state_addr, mr)
+        interp_head_addr = ULongPtr.from_user_value(interp_head_addr, mr)
+        interp_state_addr = interp_head_addr.deref()
+        interp_state = PyInterpreterState(interp_state_addr, mr)
         # XXX: Why print goes to some incorrect addr?
-        #print interp_state[0]['tstate_head'][0]['frame']
-        thread_state_ptr = interp_state[0]['tstate_head']
+        # print interp_state.tstate_head[0]
+        thread_state_ptr = interp_state['tstate_head']
         while thread_state_ptr:
             print "# # # Another thread"
-            cur_frame_ptr = thread_state_ptr[0]['frame']
+            cur_frame_ptr = thread_state_ptr.deref()['frame']
             print ''.join(format_stack(cur_frame_ptr))
-            thread_state_ptr = thread_state_ptr[0]['next']
+            thread_state_ptr = thread_state_ptr.deref()['next']
