@@ -53,14 +53,16 @@ class Structured(object):
     def __init__(self, addr, mem, user_value=None, *args, **kwargs):
         super(Structured, self).__init__(*args, **kwargs)
         if not ((addr is not None) ^ (user_value is not None)):
-            raise TypeError("You must specify either addr or value")
-        # Let's simplify life by this innocent hack
-        # XXX: Pointer to pointers? what to do?
-        if isinstance(addr, Primitive):
-            addr = addr._value
+            raise TypeError("You must specify either addr or value, not both (%r, %r)" % (addr, user_value))
         self._addr = addr
         self._mem = mem
         self._user_value = user_value
+
+    def cast_to(self, another_type):
+        return another_type(self._addr, self._mem, user_value=self._user_value)
+
+    def get_pointer(self):
+        return PtrTo(type(self))(addr=None, mem=self._mem, user_value=self.get_addr())
 
     def as_python_value(self):
         return self
@@ -94,6 +96,28 @@ class Structured(object):
     def get_size(self):
         raise NotImplementedError
 
+    def get_addr(self):
+        if self._addr is None:
+            raise ValueError("%s has no addr (user created value)" % str(self))
+        return self._addr
+
+    def _represent_value(self):
+        return self._value
+
+    def __repr__(self):
+        props = []
+        if self._addr is not None:
+            props.append('addr=%x' % (self._addr,))
+        value_repr = '<unreadable>'
+        try:
+            value_repr = self._represent_value()
+        except Exception:
+            pass
+        if value_repr is not None:
+            props.append('value=%s' % (value_repr,))
+        return '%s(%s)' % (self.__class__.__name__, ', '.join(props))
+
+
 class Primitive(Structured):
     """Single primitive object unpacked by struct.unpack"""
     format = None
@@ -110,9 +134,6 @@ class Primitive(Structured):
 
     def get_size(self):
         return struct.calcsize(self.format)
-
-    def __repr__(self):
-        return '%s(addr=%s)' % (self.__class__.__name__, self._addr)
 
 def create_Primitive(name, format):
     return type(name, (Primitive,), {'format': format})
@@ -204,9 +225,13 @@ def ArrayOf(value_type, size):
 def Stub(size):
     return [None, ArrayOf(Char, size)]
 
-def PtrTo(value_type):
-    return type(value_type.__name__ + 'Ptr',
-               (Ptr,), dict(value_type=value_type))
+def PtrTo(value_type, cache={}):
+    if value_type not in cache:
+        cache[value_type] = type(
+            value_type.__name__ + 'Ptr',
+            (Ptr,), dict(value_type=value_type)
+        )
+    return cache[value_type]
 
 class Ptr(ULong):
     value_type = None
@@ -220,27 +245,27 @@ class Ptr(ULong):
         # Pointers must return themselves
         return self
 
-    def deref_field(self, as_python_value=False):
+    def deref_boxed(self, as_python_value=False):
         result = self.value_type(self._value, self._mem)
         if as_python_value:
             result = result.as_python_value()
         return result
 
     def deref(self):
-        return self.deref_field(as_python_value=True)
+        return self.deref_boxed(as_python_value=True)
 
     def __iadd__(self, other):
         if isinstance(other, Ptr):
             adding = other._value
         else:
-            adding = other * self.deref_field().get_size()
+            adding = other * self.deref_boxed().get_size()
         self._value += adding
         return self
 
     def get_slice_fields(self, start, stop, as_python_values=False):
         result = []
         for i in xrange(start, stop):
-            result.append((self + i).deref_field(as_python_value=as_python_values))
+            result.append((self + i).deref_boxed(as_python_value=as_python_values))
         return result
 
     def get_slice(self, start, stop):
@@ -258,11 +283,14 @@ class Ptr(ULong):
             raise ValueError("Right bound must be closed")
         return self.get_slice(start, stop)
 
+    def _represent_value(self):
+        return '0x%x' % self._ptr
+
 class VoidPtrDereference(Exception):
     """Someone tried to dereference a void pointer"""
 
 class VoidPtr(Ptr):
-    def deref_field(self):
+    def deref_boxed(self, *args, **kwargs):
         raise VoidPtrDereference(self)
 
 class CharPtr(Ptr):
