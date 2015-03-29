@@ -62,6 +62,9 @@ class Structured(object):
         self._mem = mem
         self._user_value = user_value
 
+    def as_python_value(self):
+        return self
+
     def __add__(self, other):
         result = self.from_user_value(self._value, self._mem)
         result += other
@@ -95,6 +98,9 @@ class Primitive(Structured):
     """Single primitive object unpacked by struct.unpack"""
     format = None
 
+    def as_python_value(self):
+        return self._value
+
     def __nonzero__(self):
         return bool(self._value)
 
@@ -127,9 +133,7 @@ class Compound(Structured, collections.Mapping):
 
     def __getitem__(self, item):
         result = self._fields[item]
-        if isinstance(result, Primitive) and not isinstance(result, Ptr):
-            result = result._value
-        return result
+        return result.as_python_value()
 
     def __iter__(self):
         return iter(self._fields)
@@ -212,16 +216,18 @@ class Ptr(ULong):
         """Address where Ptr points to"""
         return self._value
 
-    def deref(self):
-        value_field = self.deref_field()
-        if issubclass(self.value_type, Primitive) and not isinstance(self.value_type, Ptr):
-            result = value_field._value
-        else:
-            result = value_field
+    def as_python_value(self):
+        # Pointers must return themselves
+        return self
+
+    def deref_field(self, as_python_value=False):
+        result = self.value_type(self._value, self._mem)
+        if as_python_value:
+            result = result.as_python_value()
         return result
 
-    def deref_field(self):
-        return self.value_type(self._value, self._mem)
+    def deref(self):
+        return self.deref_field(as_python_value=True)
 
     def __iadd__(self, other):
         if isinstance(other, Ptr):
@@ -231,14 +237,14 @@ class Ptr(ULong):
         self._value += adding
         return self
 
-    def get_slice_fields(self, start, stop):
+    def get_slice_fields(self, start, stop, as_python_values=False):
         result = []
         for i in xrange(start, stop):
-            result.append((self + i).deref_field())
+            result.append((self + i).deref_field(as_python_value=as_python_values))
         return result
 
     def get_slice(self, start, stop):
-        return [field._value for field in self.get_slice_fields(start, stop)]
+        return self.get_slice_fields(start, stop, as_python_values=True)
 
     def __getitem__(self, item):
         start = stop = None
@@ -256,7 +262,7 @@ class VoidPtrDereference(Exception):
     """Someone tried to dereference a void pointer"""
 
 class VoidPtr(Ptr):
-    def deref(self):
+    def deref_field(self):
         raise VoidPtrDereference(self)
 
 class CharPtr(Ptr):
@@ -391,30 +397,6 @@ class PyCodeObject(PyObject):
         ]
 
 PyCodeObjectPtr = PtrTo(PyCodeObject)
-
-"""
-typedef struct {
-    PyObject_HEAD
-    int co_argcount;        /* #arguments, except *args */
-    int co_nlocals;     /* #local variables */
-    int co_stacksize;       /* #entries needed for evaluation stack */
-    int co_flags;       /* CO_..., see below */
-    PyObject *co_code;      /* instruction opcodes */
-    PyObject *co_consts;    /* list (constants used) */
-    PyObject *co_names;     /* list of strings (names used) */
-    PyObject *co_varnames;  /* tuple of strings (local variable names) */
-    PyObject *co_freevars;  /* tuple of strings (free variable names) */
-    PyObject *co_cellvars;      /* tuple of strings (cell variable names) */
-    /* The rest doesn't count for hash/cmp */
-    PyObject *co_filename;  /* string (where it was loaded from) */
-    PyObject *co_name;      /* string (name, for reference) */
-    int co_firstlineno;     /* first source line number */
-    PyObject *co_lnotab;    /* string (encoding addr<->lineno mapping) See
-                   Objects/lnotab_notes.txt for details. */
-    void *co_zombieframe;     /* for optimization only (see frameobject.c) */
-    PyObject *co_weakreflist;   /* to support weakrefs to code objects */
-} PyCodeObject;
-"""
 
 """
 int
@@ -579,7 +561,7 @@ if __name__ == '__main__':
         interp_state_addr = interp_head_addr.deref()
         interp_state = PyInterpreterState(interp_state_addr, mr)
         # XXX: Why print goes to some incorrect addr?
-        # print interp_state.tstate_head[0]
+        # print interp_state.tstate_head[0].gilstate_counter
         thread_state_ptr = interp_state['tstate_head']
         while thread_state_ptr:
             print "# # # Another thread"
