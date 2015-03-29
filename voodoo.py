@@ -7,21 +7,22 @@ import contextlib, subprocess
 from pprint import pprint
 import collections
 import logging
+import itertools
 from functools import partial
 from logging import warning, debug
 
 MemMap = collections.namedtuple("MemMap", "start end perms offset dev inode filename")
 
-PAGE_SIZE = 4096
-INTERP_HEAD_OFFSET = 0x90b0
-GENERATIONS_OFFSET = 0x35b00
-
+class UnreadableMemory(Exception):
+    """Memory can't be read"""
 
 class MemReader(object):
 
     def __init__(self, pid):
         self._pid = pid
         self._fh = None
+
+        self._total_read = 0
 
     def __enter__(self):
         self._fh = open('/proc/%d/mem' % self._pid)
@@ -30,13 +31,19 @@ class MemReader(object):
     def __exit__(self, *args):
         self._fh.close()
         self._fh = None
+        debug("Total read %d bytes", self._total_read)
 
     def read(self, start, end):
-        real_start = int(start / PAGE_SIZE) * PAGE_SIZE
-        real_end = int((end + (PAGE_SIZE - 1)) / PAGE_SIZE) * PAGE_SIZE
-        self._fh.seek(real_start)
-        aligned_result = self._fh.read(real_end - real_start)
-        return aligned_result[start - real_start: end - real_start]
+        try:
+            self._fh.seek(start)
+        except OverflowError:
+            raise UnreadableMemory(start)
+        try:
+            result = self._fh.read(end - start)
+        except IOError:
+            raise UnreadableMemory(start, end)
+        self._total_read += len(result)
+        return result
 
     def __getitem__(self, item):
         if isinstance(item, slice):
@@ -57,6 +64,9 @@ class Structured(object):
         self._addr = addr
         self._mem = mem
         self._user_value = user_value
+
+    def __hash__(self):
+        return hash((type(self), self._addr, self._mem, self._user_value))
 
     def cast_to(self, another_type):
         return another_type(self._addr, self._mem, user_value=self._user_value)
@@ -111,8 +121,8 @@ class Structured(object):
         value_repr = '<unreadable>'
         try:
             value_repr = self._represent_value()
-        except Exception:
-            pass
+        except UnreadableMemory:
+            debug("Failed to represent %s", self.__class__.__name__, exc_info=True)
         if value_repr is not None:
             props.append('value=%s' % (value_repr,))
         return '%s(%s)' % (self.__class__.__name__, ', '.join(props))
@@ -169,8 +179,7 @@ class Compound(Structured, collections.Mapping):
             raise AttributeError(attr)
         return result
 
-    @classmethod
-    def get_fields(cls):
+    def get_fields(self):
         # [['field', type]]
         return []
 
@@ -178,8 +187,7 @@ class Compound(Structured, collections.Mapping):
         offset = 0
         for field_name, field_type in self.get_fields():
             field = field_type(self._addr + offset, self._mem)
-            if field_name is not None:
-                yield field_name, field
+            yield field_name, field
             offset += field.get_size()
 
     def get_size(self):
@@ -189,7 +197,9 @@ class Compound(Structured, collections.Mapping):
         return result
 
     def read_from_mem(self):
-        return collections.OrderedDict(self.parse_fields())
+        return collections.OrderedDict(
+            (k, v) for (k, v) in self.parse_fields() if k is not None
+        )
 
     def offset_of(self, name):
         for field_name, field in self.parse_fields():
@@ -207,12 +217,12 @@ class Compound(Structured, collections.Mapping):
 class Array(Compound):
     value_type = None
     size = 0
-    @classmethod
-    def get_fields(cls):
-        return [[i, cls.value_type] for i in xrange(cls.size)]
+    def get_fields(self):
+        return [[i, self.value_type] for i in xrange(self.size)]
 
     def read_from_mem(self):
-        ordered_dct = super(ArrayOf, self).read_from_mem()
+        ordered_dct = super(Array, self).read_from_mem()
+        result = []
         for i in xrange(len(ordered_dct)):
             result.append(ordered_dct[i])
         return result
@@ -298,6 +308,14 @@ class CharPtr(Ptr):
     def get_slice(self, start, stop):
         return ''.join(super(CharPtr, self).get_slice(start, stop))
 
+    def get_null_terminated(self):
+        result = []
+        for i in itertools.count(0):
+            if self[i] == '\x00':
+                break
+            result.append(self[i])
+        return ''.join(result)
+
 ULongPtr = PtrTo(ULong)
 
 class PyInterpreterState(Compound):
@@ -305,7 +323,7 @@ class PyInterpreterState(Compound):
         return [
             ['next', PyInterpreterStatePtr],
             ['tstate_head',  PyThreadStatePtr],
-            ['modules', PyObjectPtr],
+            ['modules', PyDictObjectPtr],
             ['sysdict', PyObjectPtr],
             ['builtins', PyObjectPtr],
             ['modules_reloading', PyObjectPtr],
@@ -346,14 +364,36 @@ class PyThreadState(Compound):
 
 PyThreadStatePtr = PtrTo(PyThreadState)
 
-PyTypeObjectPtr = VoidPtr
-
 class PyObject(Compound):
     def get_fields(self):
         return [
             ['ob_refcnt', ULong],
             ['ob_type', PyTypeObjectPtr]
         ]
+
+    def get_type_name(self):
+        return self.ob_type.deref_boxed().tp_name.get_null_terminated()
+
+    def get_type_hierarchy(self):
+        tp_ptr = self.ob_type
+        while tp_ptr:
+            yield tp_ptr
+            tp_ptr = tp_ptr.deref_boxed().tp_base
+
+    def isinstance(self, type_name):
+        for type_ptr in self.get_type_hierarchy():
+            if type_ptr.deref_boxed().tp_name.get_null_terminated() == type_name:
+                return True
+        return False
+
+    def as_python_value(self):
+        tp_name = self.get_type_name()
+        result = self
+        if tp_name == 'str':
+            result = self.cast_to(PyStringObject).to_string()
+        elif tp_name == 'dict':
+            result = self.cast_to(PyDictObject).to_dict()
+        return result
 
 PyObjectPtr = PtrTo(PyObject)
 
@@ -426,6 +466,44 @@ class PyCodeObject(PyObject):
 
 PyCodeObjectPtr = PtrTo(PyCodeObject)
 
+class PyTypeObject(PyVarObject):
+    def get_fields(self):
+        return super(PyTypeObject, self).get_fields() + [
+            ['tp_name', CharPtr],
+            Stub(8),
+            ['tp_basicsize', Int],
+            ['tp_itemsize', Int],
+            ['tp_dealloc', VoidPtr],
+            ['tp_print', VoidPtr],
+            ['tp_getattr', VoidPtr],
+            ['tp_setattr', VoidPtr],
+            ['tp_compare', VoidPtr],
+            ['tp_repr', VoidPtr],
+            ['tp_as_number', VoidPtr],
+            ['tp_as_sequence', VoidPtr],
+            ['tp_as_mapping', VoidPtr],
+            ['tp_hash', VoidPtr],
+            ['tp_call', VoidPtr],
+            ['tp_str', VoidPtr],
+            ['tp_getattro', VoidPtr],
+            ['tp_setattro', VoidPtr],
+            ['tp_as_buffer', VoidPtr],
+            ['tp_flags', Long],
+            ['tp_doc', CharPtr],
+            ['tp_traverse', VoidPtr],
+            ['tp_clear', VoidPtr],
+            ['tp_richcompare', VoidPtr],
+            ['tp_weaklistoffset', VoidPtr],
+            ['tp_iter', VoidPtr],
+            ['tp_iternext', VoidPtr],
+            ['tp_methods', VoidPtr],
+            ['tp_members', VoidPtr],
+            ['tp_getset', VoidPtr],
+            ['tp_base', PyTypeObjectPtr],
+        ]
+
+PyTypeObjectPtr = PtrTo(PyTypeObject)
+
 """
 int
 PyCode_Addr2Line(PyCodeObject *co, int addrq)
@@ -489,10 +567,10 @@ def cmd_as_file(*args, **kwargs):
 
 def format_frame(frame):
     f_code = frame['f_code'].deref()
-    co_filename = f_code['co_filename'].deref().to_string()
+    co_filename = f_code['co_filename'].deref()
     co_firstlineno = f_code['co_firstlineno']
-    co_lnotab = f_code['co_lnotab'].deref().to_string()
-    co_name = f_code['co_name'].deref().to_string()
+    co_lnotab = f_code['co_lnotab'].deref()
+    co_name = f_code['co_name'].deref()
     line_no = PyCode_Addr2Line(co_lnotab, frame['f_lasti'], co_firstlineno)
     line = linecache.getline(co_filename, line_no)
     return '%s:%s(%d)\n%s' % (
@@ -507,7 +585,7 @@ def format_stack(frame_ptr):
         frame_ptr = frame['f_back']
     return result[::-1]
 
-def get_interp_head_through_libpython(pid):
+def get_symbol_through_libpython(pid, symbol):
     for mapping in read_proc_maps(pid):
         if mapping.filename and 'libpython2.7.so' in mapping.filename and mapping.perms == 'r-xp':
             libpython_mapping = mapping
@@ -521,14 +599,15 @@ def get_interp_head_through_libpython(pid):
 
     with cmd_as_file(['objdump', '--syms', libpython_filename]) as f:
         for line in f:
-            if line.strip().endswith('interp_head'):
-                debug("Found interp_head symbol: '%s'", ' '.join(line.strip().split()))
-                interp_head_offset = int(line.strip().split()[0], 16)
+            line = line.strip().split()
+            if line and line[-1] == symbol:
+                debug("Found %s symbol: '%s'", symbol, ' '.join(line))
+                symbol_offset = int(line[0], 16)
                 break
         else:
-            warning("Couldn't find interp_head symbol in %s", libpython_filename)
+            warning("Couldn't find %s symbol in %s", symbol, libpython_filename)
             return
-    return libpython_mapping.start + interp_head_offset
+    return libpython_mapping.start + symbol_offset
 
 def get_interp_head_through_PyInterpreterState_Head(pid):
     for mapping in read_proc_maps(pid):
@@ -563,6 +642,90 @@ def get_interp_head_through_PyInterpreterState_Head(pid):
         interp_head_addr = mov_operand + func_offset + len(mov_instr)
         return interp_head_addr
 
+class PyDictEntry(Compound):
+    @classmethod
+    def get_fields(self):
+        return [
+            ['me_hash', ULong],
+            ['me_key', PyObjectPtr],
+            ['me_value', PyObjectPtr],
+        ]
+
+PyDictEntryPtr = PtrTo(PyDictEntry)
+
+class PyDictObject(PyObject):
+    def get_fields(self):
+        return super(PyDictObject, self).get_fields() + [
+            ['ma_fill', ULong],
+            ['ma_used', ULong],
+            ['ma_mask', ULong],
+            ['ma_table', PyDictEntryPtr],
+            # We are not interested in further fields
+            ['ma_lookup', VoidPtr],
+            ['ma_smalltable', ArrayOf(PyDictEntry, 8)]
+        ]
+
+    def to_dict(self):
+        result = {}
+        for i in xrange(self.ma_mask + 1):
+            entry = self.ma_table[i]
+            if entry.me_key and entry.me_value:
+                key = entry.me_key.deref()
+                if key == '<dummy key>':
+                    continue
+                result[key] = entry.me_value.deref()
+        return result
+
+class PyGC_Head(Compound):
+    def get_fields(self):
+        return [
+            ['gc_next', PyGC_HeadPtr],
+            ['gc_prev', PyGC_HeadPtr],
+            ['gc_refs', ULong],
+            Stub(8),
+        ]
+
+    def get_object_ptr(self):
+        return (self.get_pointer() + 1).cast_to(PyObjectPtr)
+
+PyGC_HeadPtr = PtrTo(PyGC_Head)
+
+class gc_generation(Compound):
+    def get_fields(self):
+        return [
+            ['head', PyGC_Head],
+            ['threshold', Int],
+            ['count', Int],
+            Stub(8),
+        ]
+
+
+NUM_GENERATIONS = 3
+
+generations_array = ArrayOf(gc_generation, NUM_GENERATIONS)
+
+PyDictObjectPtr = PtrTo(PyDictObject)
+
+class PyGreenlet(PyObject):
+    def get_fields(self):
+        return super(PyGreenlet, self).get_fields() + [
+            ['stack_start', CharPtr],
+            ['stack_stop', CharPtr],
+            ['stack_copy', CharPtr],
+            ['stack_saved', ULong],
+            ['stack_prev', PyGreenletPtr],
+            ['parent', PyGreenletPtr],
+            ['run_info', PyObjectPtr],
+            ['top_frame', PyFrameObjectPtr],
+            ['recursion_depth', Int],
+            ['weakreflist', PyObjectPtr],
+            ['exc_type', PyObjectPtr],
+            ['exc_value', PyObjectPtr],
+            ['exc_traceback', PyObjectPtr],
+            ['dict', PyObjectPtr],
+        ]
+
+PyGreenletPtr = PtrTo(PyGreenlet)
 
 if __name__ == '__main__':
 
@@ -570,12 +733,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('pid', type=int)
     parser.add_argument('-v', '--verbose', action='store_true', help="Show debug info")
+    parser.add_argument('-g', '--greenlets', action='store_true', help="Show greenlets stacks")
     args = parser.parse_args()
     if args.verbose:
         logging.root.setLevel(logging.DEBUG)
     pid = args.pid
 
-    interp_head_addr = get_interp_head_through_libpython(pid)
+    interp_head_addr = get_symbol_through_libpython(pid, 'interp_head')
+    if args.greenlets:
+        generations_addr = get_symbol_through_libpython(pid, 'generations')
+        if generations_addr is None:
+            raise RuntimeError("Couldn't locate generations variable")
+
     if interp_head_addr is None:
         interp_head_addr = get_interp_head_through_PyInterpreterState_Head(pid)
 
@@ -584,10 +753,10 @@ if __name__ == '__main__':
 
     debug("interp_head location: %x", interp_head_addr)
 
-    with MemReader(pid) as mr:
-        interp_head_addr = ULongPtr.from_user_value(interp_head_addr, mr)
-        interp_state_addr = interp_head_addr.deref()
-        interp_state = PyInterpreterState(interp_state_addr, mr)
+    with MemReader(pid) as mem:
+        interp_head_addr = PtrTo(PyInterpreterStatePtr).from_user_value(interp_head_addr, mem)
+        interp_state_ptr = interp_head_addr.deref()
+        interp_state = interp_state_ptr.deref()
         # XXX: Why print goes to some incorrect addr?
         # print interp_state.tstate_head[0].gilstate_counter
         thread_state_ptr = interp_state['tstate_head']
@@ -596,3 +765,24 @@ if __name__ == '__main__':
             cur_frame_ptr = thread_state_ptr.deref()['frame']
             print ''.join(format_stack(cur_frame_ptr))
             thread_state_ptr = thread_state_ptr.deref()['next']
+
+        if args.greenlets:
+            generations_arr = PtrTo(generations_array).from_user_value(generations_addr, mem)
+
+            obj_ptrs = []
+            for generation_no in xrange(NUM_GENERATIONS):
+                gen_gc_head_ptr = generations_arr.deref()[generation_no].head.get_pointer()
+                gc = gen_gc_head_ptr
+                while True:
+                    gc = gc.deref().gc_next
+                    if gc._value == gen_gc_head_ptr._value:
+                        break
+                    obj_ptrs.append(gc.deref().get_object_ptr())
+            for obj_ptr in obj_ptrs:
+                obj = obj_ptr.deref_boxed()
+                if obj.isinstance('greenlet.greenlet'):
+                    gr = obj.cast_to(PyGreenlet)
+                    top_frame_ptr = gr.top_frame
+                    if top_frame_ptr:
+                        print "# # # Anothe grreenlet"
+                        print ''.join(format_stack(top_frame_ptr))
