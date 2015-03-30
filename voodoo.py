@@ -741,8 +741,8 @@ if __name__ == '__main__':
 
     interp_head_addr = get_symbol_through_libpython(pid, 'interp_head')
     if args.greenlets:
-        generations_addr = get_symbol_through_libpython(pid, 'generations')
-        if generations_addr is None:
+        generations_addr_addr = get_symbol_through_libpython(pid, '_PyGC_generation0')
+        if generations_addr_addr is None:
             raise RuntimeError("Couldn't locate generations variable")
 
     if interp_head_addr is None:
@@ -767,7 +767,7 @@ if __name__ == '__main__':
             thread_state_ptr = thread_state_ptr.deref()['next']
 
         if args.greenlets:
-            generations_arr = PtrTo(generations_array).from_user_value(generations_addr, mem)
+            generations_arr = PtrTo(PtrTo(generations_array)).from_user_value(generations_addr_addr, mem).deref()
 
             obj_ptrs = []
             for generation_no in xrange(NUM_GENERATIONS):
