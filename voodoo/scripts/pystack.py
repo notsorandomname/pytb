@@ -60,7 +60,6 @@ def main():
                         break
                     # XXX: Use thing immediately
                     obj_ptrs.append(gc.deref().get_object_ptr())
-            cdef obj_ptr
             for obj_ptr in obj_ptrs:
                 obj = obj_ptr.deref_boxed()
                 if obj.isinstance('greenlet.greenlet'):

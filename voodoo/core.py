@@ -3,7 +3,7 @@ import collections
 import struct
 import abc
 import logging
-cdef logger = logging.getLogger('voodoo.core')
+logger = logging.getLogger('voodoo.core')
 
 MemMap = collections.namedtuple("MemMap", "start end perms offset dev inode filename")
 
@@ -11,10 +11,7 @@ MemMap = collections.namedtuple("MemMap", "start end perms offset dev inode file
 class UnreadableMemory(Exception):
     """Memory can't be read"""
 
-cdef class MemReader:
-    cdef int _pid
-    cdef _fh
-    cdef long long _total_read
+class MemReader:
     def __init__(self, pid):
         self._pid = pid
         self._fh = None
@@ -36,14 +33,14 @@ cdef class MemReader:
         except OverflowError:
             raise UnreadableMemory(position)
 
-    cdef inline str _read(self, size):
+    def _read(self, size):
         try:
             return self._fh.read(size)
         except IOError:
             pos = self._fh.tell()
             raise UnreadableMemory(pos, pos + size)
 
-    cpdef str read(MemReader self, unsigned long start, unsigned long end):
+    def read(self, start, end):
         self._seek(start)
         result = self._read(end - start)
         self._total_read += len(result)
