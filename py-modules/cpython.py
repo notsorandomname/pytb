@@ -4,10 +4,14 @@ import os
 import linecache
 import subprocess
 import contextlib
-from voodoo.core import Compound, PtrTo, ArrayOf, MemReader, MemMap, Stub, CharPtr, Char, Int, Long, ULong, VoidPtr
+from voodoo.utils import profile, cmd_as_file
+from voodoo.core import Compound, PtrTo, ArrayOf, Stub, CharPtr, Char, Int, Long, ULong, VoidPtr
+
+from inspecttools import MemReader, read_proc_maps
 
 import logging
 logger = logging.getLogger('voodoo.cpython')
+
 
 class PyInterpreterState(Compound):
     @classmethod
@@ -23,6 +27,13 @@ class PyInterpreterState(Compound):
             ['codec_search_cache', PyObjectPtr],
             ['codec_error_registry', PyObjectPtr],
         ]
+
+    def get_thread_states(self, as_python_value=True):
+        thread_state_ptr = self.tstate_head
+        while thread_state_ptr:
+            thread_state = thread_state_ptr.deref_boxed(as_python_value)
+            thread_state_ptr = thread_state.next
+            yield thread_state
 
 PyInterpreterStatePtr = PtrTo(PyInterpreterState)
 
@@ -55,6 +66,9 @@ class PyThreadState(Compound):
             ['trash_delete_later', PyObjectPtr],
         ]
 
+    def get_frame(self, as_python_value=True):
+        return self.frame.deref_boxed(as_python_value)
+
 PyThreadStatePtr = PtrTo(PyThreadState)
 
 class PyObject(Compound):
@@ -68,12 +82,14 @@ class PyObject(Compound):
     def get_type_name(self):
         return self.ob_type.deref_boxed().tp_name.get_null_terminated()
 
+    @profile
     def get_type_hierarchy(self):
         tp_ptr = self.ob_type
         while tp_ptr:
             yield tp_ptr
             tp_ptr = tp_ptr.deref_boxed().tp_base
 
+    @profile
     def isinstance(self, type_name):
         for type_ptr in self.get_type_hierarchy():
             if type_ptr.deref_boxed().tp_name.get_null_terminated() == type_name:
@@ -122,6 +138,32 @@ class PyFrameObject(PyVarObject):
             # XXX: Other stuff goes here, but me too lazy
         ]
 
+    def format_stack_line(self):
+        f_code = self.f_code.deref()
+        co_filename = f_code.co_filename.deref()
+        co_firstlineno = f_code.co_firstlineno
+        co_lnotab = f_code.co_lnotab.deref()
+        co_name = f_code.co_name.deref()
+        line_no = PyCode_Addr2Line(co_lnotab, self.f_lasti, co_firstlineno)
+        line = linecache.getline(co_filename, line_no)
+        return '%s:%s(%d)\n%s' % (
+            co_filename, co_name, line_no, line
+        )
+
+    @staticmethod
+    def format_frame_stack(frame_ptr):
+        result = []
+        while frame_ptr:
+            frame = frame_ptr.deref()
+            result.append(frame.format_stack_line())
+            frame_ptr = frame['f_back']
+        return result[::-1]
+
+    def format_stack(self):
+        return PyFrameObject.format_frame_stack(self.get_pointer())
+
+
+
 PyFrameObjectPtr = PtrTo(PyFrameObject)
 
 class PyStringObject(PyVarObject):
@@ -134,9 +176,8 @@ class PyStringObject(PyVarObject):
         ]
 
     def to_string(self):
-        return CharPtr.from_user_value(
-            self._addr + self.offset_of('ob_sval'), self._mem
-        )[:self.ob_size]
+        sval_addr = self._addr + self.offset_of('ob_sval')
+        return self._mem.read(sval_addr, sval_addr + self.ob_size)
 
 PyStringObjectPtr = PtrTo(PyStringObject)
 
@@ -233,57 +274,6 @@ def PyCode_Addr2Line(lnotab, last_i, co_firstlineno):
         line +=  ord(lnotab[0]); lnotab = lnotab[1:]
     return line
 
-
-def read_proc_maps(pid):
-    maps = []
-    with open('/proc/%d/maps' % pid, 'rb') as f:
-        for line in f:
-            entries = line.split()
-            if len(entries) >= 5:
-                start, end = [int(x, 16) for x in entries[0].split('-')]
-                perms = entries[1]
-                offset = int(entries[2], 16)
-                dev = entries[3]
-                inode = int(entries[4])
-            filename = None
-            if len(entries) in (6, 7):
-                filename = entries[5]
-            else:
-                assert len(entries) == 5, entries
-
-            maps.append(MemMap(start, end, perms, offset, dev, inode, filename))
-    return maps
-
-@contextlib.contextmanager
-def cmd_as_file(*args, **kwargs):
-    kwargs['stdout'] = subprocess.PIPE
-    p = subprocess.Popen(*args, **kwargs)
-    try:
-        yield p.stdout
-    finally:
-        p.stdout.close()
-        p.wait()
-
-def format_frame(frame):
-    f_code = frame['f_code'].deref()
-    co_filename = f_code['co_filename'].deref()
-    co_firstlineno = f_code['co_firstlineno']
-    co_lnotab = f_code['co_lnotab'].deref()
-    co_name = f_code['co_name'].deref()
-    line_no = PyCode_Addr2Line(co_lnotab, frame['f_lasti'], co_firstlineno)
-    line = linecache.getline(co_filename, line_no)
-    return '%s:%s(%d)\n%s' % (
-        co_filename, co_name, line_no, line
-    )
-
-def format_stack(frame_ptr):
-    result = []
-    while frame_ptr:
-        frame = frame_ptr.deref()
-        result.append(format_frame(frame))
-        frame_ptr = frame['f_back']
-    return result[::-1]
-
 def get_symbol_through_libpython(pid, symbol):
     for mapping in read_proc_maps(pid):
         if mapping.filename and 'libpython2.7.so' in mapping.filename and mapping.perms == 'r-xp':
@@ -308,7 +298,7 @@ def get_symbol_through_libpython(pid, symbol):
             return
     return libpython_mapping.start + symbol_offset
 
-def get_interp_head_through_PyInterpreterState_Head(pid):
+def get_symbol_through_static_python(pid, symbol):
     for mapping in read_proc_maps(pid):
         if mapping.filename and os.path.basename(mapping.filename) == 'python2.7' and mapping.perms == 'r-xp':
             python_mapping = mapping
@@ -322,14 +312,19 @@ def get_interp_head_through_PyInterpreterState_Head(pid):
 
     with cmd_as_file(['objdump', '--dynamic-syms', python_filename]) as f:
         for line in f:
-            if line.strip().endswith('PyInterpreterState_Head'):
-                logger.debug("Found PyInterpreterState_Head symbol: '%s'", ' '.join(line.strip().split()))
-                func_offset = int(line.strip().split()[0], 16)
+            line = line.strip().split()
+            if line[-1] == symbol:
+                logger.debug("Found %s symbol: '%s'", symbol, ' '.join(line))
+                symbol_offset = int(line[0], 16)
                 break
         else:
-            logger.warning("Couldn't find PyInterpreterState_Head symbol in %s", python_filename)
+            logger.warning("Couldn't find %s symbol in %s", symbol, python_filename)
             return
+    return symbol_offset
 
+
+def get_interp_head_through_PyInterpreterState_Head(pid):
+    func_offset = get_symbol_through_static_python(pid, 'PyInterpreterState_Head')
     with MemReader(pid) as mr:
         mov_instr = mr[func_offset: func_offset + 7]
         logger.debug("mov operation: %r %r", mov_instr[:3].encode('hex'), mov_instr[3:].encode('hex'))
@@ -429,3 +424,58 @@ class PyGreenlet(PyObject):
         ]
 
 PyGreenletPtr = PtrTo(PyGreenlet)
+
+
+class Python(object):
+    def __init__(self, pid):
+        self._pid = pid
+        self._reinit()
+
+    def _reinit(self):
+        self._mem = None
+        self._interp_head = None
+        self._gc_generations = None
+
+    def __enter__(self):
+        self._mem = MemReader(self._pid)
+        self._mem.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        result = self._mem.__exit__(*args)
+        self._reinit()
+        return result
+
+    @property
+    def interp_head(self):
+        if self._interp_head is not None:
+            return self._interp_head
+        interp_head_addr = get_symbol_through_libpython(self._pid, 'interp_head')
+        if interp_head_addr is None:
+            interp_head_addr = get_interp_head_through_PyInterpreterState_Head(self._pid)
+        if interp_head_addr is None:
+            raise ValueError("Could not find interp_head symbol for pid %s" % str(self._pid))
+        interp_head_addr = PtrTo(
+            PyInterpreterStatePtr
+        ).from_user_value(interp_head_addr, self._mem)
+        interp_head = interp_head_addr.deref()
+        self._interp_head = interp_head
+        return interp_head
+
+    @property
+    def interp_state(self):
+        return self.interp_head.deref()
+
+    @property
+    def interp_states(self):
+        raise NotImplementedError
+
+
+
+"""    if args.greenlets:
+        generations_addr_addr = get_symbol_through_libpython(pid, '_PyGC_generation0')
+        if generations_addr_addr is None:
+            raise RuntimeError("Couldn't locate generations variable")
+
+
+"""

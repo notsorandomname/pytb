@@ -18,4 +18,5 @@ setup(
         ]
     },
     packages=packages,
+    package_dir=packages,
 )

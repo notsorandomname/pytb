@@ -3,80 +3,11 @@ import collections
 import struct
 import abc
 import logging
-logger = logging.getLogger('voodoo.core')
+logger = logging.getLogger(__name__)
 
-MemMap = collections.namedtuple("MemMap", "start end perms offset dev inode filename")
+from .utils import profile
 
-
-class UnreadableMemory(Exception):
-    """Memory can't be read"""
-
-class MemReader:
-    def __init__(self, pid):
-        self._pid = pid
-        self._fh = None
-        # Debug stats
-        self._total_read = 0
-
-    def __enter__(self):
-        self._fh = open('/proc/%d/mem' % self._pid)
-        return self
-
-    def __exit__(self, *args):
-        self._fh.close()
-        self._fh = None
-        logger.debug("Total read %d bytes", self._total_read)
-
-    def _seek(self, position):
-        try:
-            self._fh.seek(position)
-        except OverflowError:
-            raise UnreadableMemory(position)
-
-    def _read(self, size):
-        try:
-            return self._fh.read(size)
-        except IOError:
-            pos = self._fh.tell()
-            raise UnreadableMemory(pos, pos + size)
-
-    def read(self, start, end):
-        self._seek(start)
-        result = self._read(end - start)
-        self._total_read += len(result)
-        return result
-
-    def __getitem__(self, item):
-        if isinstance(item, slice):
-            item = (item.start, item.stop)
-        if isinstance(item, (long, int)):
-            item = (item, item + 1)
-        return self.read(item[0], item[1])
-
-    def get_null_terminated(self, addr, buf_size=256):
-        result = []
-        self._seek(addr)
-        position = addr
-        while True:
-            try:
-                chunk = self._read(buf_size)
-            except UnreadableMemory:
-                if buf_size == 1:
-                    raise
-                else:
-                    buf_size = max(1, buf_size / 2)
-                    self._seek(position)
-            else:
-                position += buf_size
-            try:
-                null_position = chunk.index('\x00')
-            except ValueError:
-                result.append(chunk)
-            else:
-                result.append(chunk[:null_position])
-                break
-        return ''.join(result)
-
+from functools import partial
 
 class Structured(object):
     """Chunk of memory of some (probably not constant - TODO) size that can be unpacked into some object or structure"""
@@ -110,7 +41,7 @@ class Structured(object):
         return self._addr
 
     def _represent_value(self):
-        return self._value
+        return None
 
     def __repr__(self):
         props = []
@@ -141,6 +72,7 @@ class Primitive(Structured):
         return cls(addr=None, mem=mem, user_value=val)
 
     @property
+    @profile
     def _value(self):
         if self._addr is not None:
             return self.read_from_mem()
@@ -179,8 +111,11 @@ class Primitive(Structured):
     def __nonzero__(self):
         return bool(self._value)
 
+    @profile
     def read_from_mem(self):
-        val = self._mem[self._addr: self._addr + self.get_size()]
+        size = self.get_size()
+        addr = self._addr
+        val = self._mem.read(addr, addr + size)
         return struct.unpack(self.format, val)[0]
 
 def create_Primitive(name, format):
@@ -198,42 +133,49 @@ class CompoundMeta(abc.ABCMeta):
         cls._fields_getters = None
         cls._fields_offsets = None
         cls._computed_size = None
+        cls._init_done = False
+
+def field_getter(field_type, offset, compound_obj):
+    return field_type(compound_obj._addr + offset, compound_obj._mem)
 
 class Compound(Structured, collections.Mapping):
     __metaclass__ = CompoundMeta
     def __init__(self, *args, **kwargs):
-        if self._fields_getters is None:
-            self._init_fields_getters()
+        if not self._init_done:
+            self._lazy_init()
         super(Compound, self).__init__(*args, **kwargs)
 
     @classmethod
     def get_size(cls):
-        if cls._computed_size is None:
-            cls._init_fields_getters()
+        if not cls._init_done:
+            cls._lazy_init()
         return cls._computed_size
 
     @classmethod
-    def _init_fields_getters(cls):
-        getters = {}
-        offsets = {}
+    def _lazy_init(cls):
+        getters = collections.OrderedDict()
+        offsets = collections.OrderedDict()
         offset = 0
         for field_name, field_type in cls.get_fields():
             offsets[field_name] = offset
-            getters[field_name] = lambda self_obj, field_type=field_type, offset=offset: field_type(self_obj._addr + offset, self_obj._mem)
-            field_size = field_type.get_size()
-            offset += field_size
+            getters[field_name] = partial(field_getter, field_type, offset)
+            offset += field_type.get_size()
         cls._computed_size = offset
         cls._fields_getters = getters
         cls._fields_offsets = offsets
+        cls._init_done = True
 
     def __getitem__(self, item):
-        return self._fields_getters[item](self).as_python_value()
+        return self._getitem_boxed(item).as_python_value()
+
+    def _getitem_boxed(self, item):
+        return self._fields_getters[item](self)
 
     def __iter__(self):
-        return iter(self._fields)
+        return iter(self._fields_getters)
 
     def __len__(self):
-        return len(self._fields)
+        return len(self._fields_getters)
 
     def __getattr__(self, attr):
         if attr.startswith('_'):
@@ -251,13 +193,9 @@ class Compound(Structured, collections.Mapping):
 
     @classmethod
     def offset_of(cls, name):
+        if not cls._init_done:
+            cls._lazy_init()
         return cls._fields_offsets[name]
-
-
-# def Stub(length):
-#     class CharArr(Struct):
-#         format = 'c' * length
-#     return [None, CharArr]
 
 class Array(Compound):
     value_type = None
@@ -275,7 +213,7 @@ class Array(Compound):
 
 def ArrayOf(value_type, size):
     return type(
-        value_type.__name__ + 'Arr', (Array,),
+        value_type.__name__ + 'Arr%d' % size, (Array,),
         dict(value_type=value_type, size=size))
 
 def Stub(size):
