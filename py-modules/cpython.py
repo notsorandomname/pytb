@@ -122,8 +122,8 @@ class PyFrameObject(PyVarObject):
         return super(PyFrameObject, cls).get_fields() + [
             ['f_back', PyFrameObjectPtr],
             ['f_code', PyCodeObjectPtr],
-            ['f_builtins', PyObjectPtr],
-            ['f_globals', PyObjectPtr],
+            ['f_builtins', PyDictObjectPtr],
+            ['f_globals', PyDictObjectPtr],
             ['f_locals', PyObjectPtr],
             ['f_valuestack', VoidPtr], # XXX: Ptr(Ptr(PyObject))
             ['f_stacktop', VoidPtr], # XXX: same
@@ -337,7 +337,7 @@ class gc_generation(Compound):
 
 NUM_GENERATIONS = 3
 
-generations_array = ArrayOf(gc_generation, NUM_GENERATIONS)
+GC_generations_array = ArrayOf(gc_generation, NUM_GENERATIONS)
 
 PyDictObjectPtr = PtrTo(PyDictObject)
 
@@ -409,6 +409,32 @@ class Python(object):
     @property
     def interp_states(self):
         raise NotImplementedError
+
+    @property
+    def gc_generations(self):
+        if self._gc_generations is not None:
+            return self._gc_generations
+        generations_addr_addr = get_symbol(self._pid, '_PyGC_generation0')
+        generations_arr = PtrTo(PtrTo(GC_generations_array)).from_user_value(
+            generations_addr_addr, self._mem).deref().deref()
+        self._gc_generations = [generations_arr[i] for i in xrange(NUM_GENERATIONS)]
+        return self._gc_generations
+
+    def get_all_objects(self):
+        "Return pointers to all GC tracked objects"
+        for generation in self.gc_generations:
+            generation_head_ptr = pygc_head_ptr = generation.head.get_pointer()
+            generation_head_addr = generation_head_ptr._value
+            while True:
+                # _PyObject_GC_UNTRACK macro says that
+                # gc_prev always points to some value
+                # there is still a race condition if PyGC_Head
+                # gets free'd and overwritten just before we look
+                # at him
+                pygc_head_ptr = pygc_head_ptr.deref().gc_prev
+                if pygc_head_ptr._value == generation_head_addr:
+                    break
+                yield pygc_head_ptr.deref().get_object_ptr()
 
 # Helpers for trying hard to extract interp_head symbol
 
