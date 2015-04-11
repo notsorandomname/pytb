@@ -7,7 +7,7 @@ import contextlib
 from voodoo.utils import profile, cmd_as_file
 from voodoo.core import Compound, PtrTo, ArrayOf, Stub, CharPtr, Char, Int, Long, ULong, VoidPtr
 
-from inspecttools import MemReader, read_proc_maps
+from inspecttools import MemReader, read_proc_maps, get_symbol, SymbolNotFound
 
 import logging
 logger = logging.getLogger('voodoo.cpython')
@@ -274,68 +274,6 @@ def PyCode_Addr2Line(lnotab, last_i, co_firstlineno):
         line +=  ord(lnotab[0]); lnotab = lnotab[1:]
     return line
 
-def get_symbol_through_libpython(pid, symbol):
-    for mapping in read_proc_maps(pid):
-        if mapping.filename and 'libpython2.7.so' in mapping.filename and mapping.perms == 'r-xp':
-            libpython_mapping = mapping
-            logger.debug("Found libpython2.7 library: %s", mapping)
-            break
-    else:
-        logger.warning("Couldn't find libpython2.7.so in memory")
-        return
-
-    libpython_filename = libpython_mapping.filename
-
-    with cmd_as_file(['objdump', '--syms', libpython_filename]) as f:
-        for line in f:
-            line = line.strip().split()
-            if line and line[-1] == symbol:
-                logger.debug("Found %s symbol: '%s'", symbol, ' '.join(line))
-                symbol_offset = int(line[0], 16)
-                break
-        else:
-            logger.warning("Couldn't find %s symbol in %s", symbol, libpython_filename)
-            return
-    return libpython_mapping.start + symbol_offset
-
-def get_symbol_through_static_python(pid, symbol):
-    for mapping in read_proc_maps(pid):
-        if mapping.filename and os.path.basename(mapping.filename) == 'python2.7' and mapping.perms == 'r-xp':
-            python_mapping = mapping
-            logger.debug("Found python2.7 mapping: %s", mapping)
-            break
-    else:
-        logger.warning("Couldn't find python2.7 executable mapping")
-        return
-
-    python_filename = python_mapping.filename
-
-    with cmd_as_file(['objdump', '--dynamic-syms', python_filename]) as f:
-        for line in f:
-            line = line.strip().split()
-            if line[-1] == symbol:
-                logger.debug("Found %s symbol: '%s'", symbol, ' '.join(line))
-                symbol_offset = int(line[0], 16)
-                break
-        else:
-            logger.warning("Couldn't find %s symbol in %s", symbol, python_filename)
-            return
-    return symbol_offset
-
-
-def get_interp_head_through_PyInterpreterState_Head(pid):
-    func_offset = get_symbol_through_static_python(pid, 'PyInterpreterState_Head')
-    with MemReader(pid) as mr:
-        mov_instr = mr[func_offset: func_offset + 7]
-        logger.debug("mov operation: %r %r", mov_instr[:3].encode('hex'), mov_instr[3:].encode('hex'))
-        retq_instr = mr[func_offset + 7: func_offset + 8]
-        if retq_instr != '\xc3':
-            logger.warning("Seems like PyInterpreterState_Head has different length in %s", python_filename)
-            return
-        mov_operand = struct.unpack('<i', mov_instr[3:])[0]
-        interp_head_addr = mov_operand + func_offset + len(mov_instr)
-        return interp_head_addr
-
 class PyDictEntry(Compound):
     @classmethod
     def get_fields(cls):
@@ -450,11 +388,13 @@ class Python(object):
     def interp_head(self):
         if self._interp_head is not None:
             return self._interp_head
-        interp_head_addr = get_symbol_through_libpython(self._pid, 'interp_head')
-        if interp_head_addr is None:
+        try:
+            interp_head_addr = get_symbol(self._pid, 'interp_head')
+            raise SymbolNotFound
+        except SymbolNotFound:
+            logger.debug("Could not find interp_head symbol")
+            # Hard way
             interp_head_addr = get_interp_head_through_PyInterpreterState_Head(self._pid)
-        if interp_head_addr is None:
-            raise ValueError("Could not find interp_head symbol for pid %s" % str(self._pid))
         interp_head_addr = PtrTo(
             PyInterpreterStatePtr
         ).from_user_value(interp_head_addr, self._mem)
@@ -470,12 +410,26 @@ class Python(object):
     def interp_states(self):
         raise NotImplementedError
 
+# Helpers for trying hard to extract interp_head symbol
 
+class BadAssembly(Exception):
+    pass
 
-"""    if args.greenlets:
-        generations_addr_addr = get_symbol_through_libpython(pid, '_PyGC_generation0')
-        if generations_addr_addr is None:
-            raise RuntimeError("Couldn't locate generations variable")
-
-
-"""
+def get_interp_head_through_PyInterpreterState_Head(pid):
+    # Let's disassemble PyInterpreterState_Head func
+    # It should look like
+    # mov someval, reg # <addr>
+    # retq
+    func_offset = get_symbol(pid, 'PyInterpreterState_Head')
+    with MemReader(pid) as mr:
+        func = mr[func_offset: func_offset + 8]
+        with cmd_as_file(['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64', '/dev/stdin'], stdin=func) as f:
+            lines = f.readlines()[-2:]
+            if len(lines) < 2 or 'ret' not in lines[-1] or 'mov' not in lines[-2] or '#' not in lines[-2]:
+                raise BadAssembly(lines)
+            absolute_addr = lines[-2].strip().split('#')[-1]
+            try:
+                absolute_addr = int(absolute_addr, 16)
+            except ValueError:
+                raise BadAssembly(str(exc), absolute_addr)
+            return absolute_addr + func_offset
