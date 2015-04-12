@@ -5,7 +5,10 @@ import linecache
 import subprocess
 import contextlib
 from voodoo.utils import profile, cmd_as_file
-from voodoo.core import Compound, PtrTo, ArrayOf, Stub, CharPtr, Char, Int, Long, ULong, VoidPtr
+from voodoo.core import (
+    Compound, PtrTo, ArrayOf, Stub, CharPtr, Char,
+    Int, Long, ULong, VoidPtr, UInt
+)
 
 from inspecttools import MemReader, read_proc_maps, get_symbol, SymbolNotFound
 
@@ -38,9 +41,12 @@ class PyInterpreterState(Compound):
 PyInterpreterStatePtr = PtrTo(PyInterpreterState)
 
 class PyThreadState(Compound):
+    py3k = False
+
     @classmethod
     def get_fields(cls):
         return [
+            ['prev', PyThreadStatePtr] * cls.py3k,
             ['next', PyThreadStatePtr],
             ['interp', PyInterpreterStatePtr],
             ['frame', PyFrameObjectPtr],
@@ -72,6 +78,7 @@ class PyThreadState(Compound):
 PyThreadStatePtr = PtrTo(PyThreadState)
 
 class PyObject(Compound):
+    py3k = False
     @classmethod
     def get_fields(cls):
         return [
@@ -79,27 +86,26 @@ class PyObject(Compound):
             ['ob_type', PyTypeObjectPtr]
         ]
 
-    def get_type_name(self):
-        return self.ob_type.deref_boxed().tp_name.get_null_terminated()
-
-    @profile
-    def get_type_hierarchy(self):
-        tp_ptr = self.ob_type
-        while tp_ptr:
-            yield tp_ptr
-            tp_ptr = tp_ptr.deref_boxed().tp_base
+    @property
+    def type(self):
+        return self.ob_type.deref_boxed()
 
     @profile
     def isinstance(self, type_name):
-        for type_ptr in self.get_type_hierarchy():
-            if type_ptr.deref_boxed().tp_name.get_null_terminated() == type_name:
+        for tp in self.type.hierarchy:
+            if tp.name == type_name:
                 return True
         return False
 
     def as_python_value(self):
-        tp_name = self.get_type_name()
+        tp_name = self.type.name
         result = self
         if tp_name == 'str':
+            if self.py3k:
+                result = self.cast_to(PyUnicodeObject).to_string()
+            else:
+                result = self.cast_to(PyStringObject).to_string()
+        elif tp_name == 'bytes':
             result = self.cast_to(PyStringObject).to_string()
         elif tp_name == 'dict':
             result = self.cast_to(PyDictObject).to_dict()
@@ -117,6 +123,7 @@ class PyVarObject(PyObject):
 PyVarObjectPtr = PtrTo(PyVarObject)
 
 class PyFrameObject(PyVarObject):
+    py3k = False
     @classmethod
     def get_fields(cls):
         return super(PyFrameObject, cls).get_fields() + [
@@ -138,40 +145,50 @@ class PyFrameObject(PyVarObject):
             # XXX: Other stuff goes here, but me too lazy
         ]
 
-    def format_stack_line(self):
-        f_code = self.f_code.deref()
-        co_filename = f_code.co_filename.deref()
+    def get_lineno(self):
+        f_code = self.f_code.deref_boxed()
         co_firstlineno = f_code.co_firstlineno
         co_lnotab = f_code.co_lnotab.deref()
+        return PyCode_Addr2Line(co_lnotab, self.f_lasti, co_firstlineno)
+
+    def format_stack_line(self, scriptdir):
+        f_code = self.f_code.deref()
+        co_filename = f_code.co_filename.deref()
         co_name = f_code.co_name.deref()
-        line_no = PyCode_Addr2Line(co_lnotab, self.f_lasti, co_firstlineno)
-        line = linecache.getline(co_filename, line_no)
+        filename = os.path.join(scriptdir, co_filename)
+        lineno = self.get_lineno()
+        line = linecache.getline(filename, lineno)
         return '%s:%s(%d)\n%s' % (
-            co_filename, co_name, line_no, line
+            filename, co_name, lineno, line
         )
 
     @staticmethod
-    def format_frame_stack(frame_ptr):
+    def format_frame_stack(frame_ptr, scriptdir):
         result = []
         while frame_ptr:
             frame = frame_ptr.deref()
-            result.append(frame.format_stack_line())
-            frame_ptr = frame['f_back']
+            result.append(frame.format_stack_line(scriptdir))
+            frame_ptr = frame.f_back
         return result[::-1]
 
-    def format_stack(self):
-        return PyFrameObject.format_frame_stack(self.get_pointer())
+    def format_stack(self, scriptdir=None):
+        if scriptdir is None:
+            raise TypeError("Script co_filename are relative to script location")
+        if scriptdir is None:
+            scriptdir = os.getcwd()
+        return PyFrameObject.format_frame_stack(self.get_pointer(), scriptdir=scriptdir)
 
 
 
 PyFrameObjectPtr = PtrTo(PyFrameObject)
 
 class PyStringObject(PyVarObject):
+    py3k = False
     @classmethod
     def get_fields(cls):
         return super(PyStringObject, cls).get_fields() + [
             ['ob_shash', Long],
-            ['ob_sstate', Int],
+            ['ob_sstate', Int] * (not cls.py3k),
             ['ob_sval', Char]
         ]
 
@@ -181,12 +198,80 @@ class PyStringObject(PyVarObject):
 
 PyStringObjectPtr = PtrTo(PyStringObject)
 
+# py3k only
+
+PyBytesObject = PyStringObject._customized_from_kwargs(py3k=True)
+
+PyBytesObjectPtr = PtrTo(PyBytesObject)
+
+class PyASCIIObject(PyObject):
+    @classmethod
+    def get_fields(cls):
+        return super(PyASCIIObject, cls).get_fields() + [
+            ['length', ULong],
+            ['hash', ULong],
+            ['bitfields', UInt],
+            Stub(4),
+            ['wstr', VoidPtr],
+        ]
+
+class PyCompactUnicodeObject(PyASCIIObject):
+    @classmethod
+    def get_fields(cls):
+        return super(PyCompactUnicodeObject, cls).get_fields() + [
+            ['utf8_length', ULong],
+            ['utf8', CharPtr],
+            ['wstr_length', ULong],
+        ]
+
+class PyUnicodeObject(PyCompactUnicodeObject):
+    @classmethod
+    def get_fields(cls):
+        return super(PyUnicodeObject, cls).get_fields() + [
+            ['data', CharPtr], # actually there is a union here
+        ]
+
+    def to_string(self):
+        # XXX: Legacy strings?
+        bitfields = self.bitfields
+        interned = bitfields & 0b11
+        bitfields >>= 2
+        kind = bitfields & 0b111
+        bitfields >>= 3
+        compact = bitfields & 0b1
+        bitfields >>= 1
+        ascii = bitfields & 0b1
+        bitfields >>= 1
+        ready = bitfields & 0b1
+        bitfields >>= 1
+
+        if kind not in (1, 2, 4):
+            raise NotImplementedError("kind", kind)
+        if ascii == 1:
+            data_offset = PyASCIIObject.get_size()
+        else:
+            data_offset = PyCompactUnicodeObject.get_size()
+
+        buf_size = kind * self.length
+        buf_addr = self._addr + data_offset
+
+        buf = self._mem.read(buf_addr, buf_addr + buf_size)
+
+        if kind == 2:
+            buf = buf.decode('utf-16')
+        elif kind == 4:
+            buf = buf.decode('utf-32')
+
+        return buf
+
 class PyCodeObject(PyObject):
+    py3k = False
     @classmethod
     def get_fields(cls):
         return super(PyCodeObject, cls).get_fields() + [
             ['co_argcount', Int],
             ['co_nlocals', Int],
+            ['co_kwonlyargcount', Int] * cls.py3k,
             ['co_stacksize', Int],
             ['co_flags', Int],
             ['co_code', PyObjectPtr],
@@ -195,6 +280,8 @@ class PyCodeObject(PyObject):
             ['co_varnames', PyObjectPtr],
             ['co_freevars', PyObjectPtr],
             ['co_cellvars', PyObjectPtr],
+            ['co_cell2arg', CharPtr] * cls.py3k,
+            Stub(4) * cls.py3k,
             ['co_filename', PyStringObjectPtr],
             ['co_name', PyStringObjectPtr],
             ['co_firstlineno', Int],
@@ -206,6 +293,19 @@ class PyCodeObject(PyObject):
 PyCodeObjectPtr = PtrTo(PyCodeObject)
 
 class PyTypeObject(PyVarObject):
+    @property
+    def name(self):
+        return self.tp_name.get_null_terminated()
+
+    @property
+    def hierarchy(self):
+        tp_ptr = self.get_pointer()
+        while tp_ptr:
+            tp = tp_ptr.deref_boxed()
+            yield tp
+            tp_ptr = tp.tp_base
+
+
     @classmethod
     def get_fields(cls):
         return super(PyTypeObject, cls).get_fields() + [
@@ -260,6 +360,7 @@ PyCode_Addr2Line(PyCodeObject *co, int addrq)
     }
     return line;
 }
+
 """
 
 def PyCode_Addr2Line(lnotab, last_i, co_firstlineno):
@@ -285,10 +386,25 @@ class PyDictEntry(Compound):
 
 PyDictEntryPtr = PtrTo(PyDictEntry)
 
-class PyDictObject(PyObject):
+class PyDictKeysObject(Compound):
     @classmethod
     def get_fields(cls):
-        return super(PyDictObject, cls).get_fields() + [
+        return [
+            ['dk_refcnt', ULong],
+            ['dk_size', ULong],
+            ['dk_lookup', VoidPtr],
+            ['dk_usable', ULong],
+            # repeated dk_size times
+            ['dk_entries', PyDictEntry],
+        ]
+
+PyDictKeysObjectPtr = PtrTo(PyDictKeysObject)
+
+class PyDictObject(PyObject):
+    py3k = False
+    @classmethod
+    def get_fields(cls):
+        py2_version = [
             ['ma_fill', ULong],
             ['ma_used', ULong],
             ['ma_mask', ULong],
@@ -297,26 +413,80 @@ class PyDictObject(PyObject):
             ['ma_lookup', VoidPtr],
             ['ma_smalltable', ArrayOf(PyDictEntry, 8)]
         ]
+        py3_version = [
+            ['ma_used', ULong],
+            ['ma_keys', PyDictKeysObjectPtr],
+            ['ma_values', PtrTo(PyObjectPtr)]
+        ]
+        return super(PyDictObject, cls).get_fields() + (
+            py3_version if cls.py3k else py2_version
+        )
 
-    def to_dict(self):
+    @staticmethod
+    def entries_to_dict(entries_ptr, size, values_ptr, allow_dummy=False, py3k=False, as_python_value=True):
         result = {}
-        for i in xrange(self.ma_mask + 1):
-            entry = self.ma_table[i]
+        for i in xrange(size):
+            entry = entries_ptr[i]
             if entry.me_key and entry.me_value:
-                key = entry.me_key.deref()
-                if key == '<dummy key>':
-                    continue
-                result[key] = entry.me_value.deref()
+                key = entry.me_key.deref_boxed()
+                key_python = key.as_python_value()
+                if allow_dummy:
+                    if py3k:
+                        if key.type.name ==  "<dummy key> type":
+                            continue
+                    elif key_python == '<dummy key>':
+                        continue
+                if as_python_value:
+                    key = key_python
+                if values_ptr:
+                    value = values_ptr + i
+                else:
+                    value = entry.me_value
+                result[key] = value.deref_boxed(as_python_value)
         return result
 
+    def to_dict(self, as_python_value=True):
+        if self.py3k:
+            return self.to_dict_v3(as_python_value)
+        else:
+            return self.to_dict_v2(as_python_value)
+
+    def to_dict_v2(self, as_python_value):
+        return PyDictObject.entries_to_dict(
+            self.ma_table, self.ma_mask + 1, values_ptr=None,
+            allow_dummy=True, py3k=False,
+            as_python_value=as_python_value)
+
+    def to_dict_v3(self, as_python_value):
+        keys_obj = self.ma_keys.deref_boxed()
+        return PyDictObject.entries_to_dict(
+            keys_obj.dk_entries.get_pointer(),
+            keys_obj.dk_size, values_ptr=self.ma_values,
+            allow_dummy=False, py3k=True,
+            as_python_value=as_python_value,
+        )
+
+PyDictObjectPtr = PtrTo(PyDictObject)
+
+
+class PyModuleObject(PyObject):
+    @classmethod
+    def get_fields(cls):
+        return super(PyModuleObject, cls).get_fields() + [
+            ['md_dict', PyDictObjectPtr],
+        ]
+
+PyModuleObjectPtr = PtrTo(PyModuleObject)
+
 class PyGC_Head(Compound):
+    py3k = False
     @classmethod
     def get_fields(cls):
         return [
             ['gc_next', PyGC_HeadPtr],
             ['gc_prev', PyGC_HeadPtr],
             ['gc_refs', ULong],
-            Stub(8),
+            Stub(8) * (not cls.py3k),
         ]
 
     def get_object_ptr(self):
@@ -325,21 +495,20 @@ class PyGC_Head(Compound):
 PyGC_HeadPtr = PtrTo(PyGC_Head)
 
 class gc_generation(Compound):
+    py3k = False
     @classmethod
     def get_fields(cls):
         return [
             ['head', PyGC_Head],
             ['threshold', Int],
             ['count', Int],
-            Stub(8),
+            Stub(8) * (not cls.py3k),
         ]
 
 
 NUM_GENERATIONS = 3
 
 GC_generations_array = ArrayOf(gc_generation, NUM_GENERATIONS)
-
-PyDictObjectPtr = PtrTo(PyDictObject)
 
 class PyGreenlet(PyObject):
     @classmethod
@@ -365,9 +534,14 @@ PyGreenletPtr = PtrTo(PyGreenlet)
 
 
 class Python(object):
-    def __init__(self, pid):
+    def __init__(self, pid, py3k=False):
         self._pid = pid
+        self._py3k = py3k
         self._reinit()
+
+    @property
+    def _customization_dict(self):
+        return {'py3k': self._py3k}
 
     def _reinit(self):
         self._mem = None
@@ -395,8 +569,9 @@ class Python(object):
             logger.debug("Could not find interp_head symbol")
             # Hard way
             interp_head_addr = get_interp_head_through_PyInterpreterState_Head(self._pid)
+        interp_state_type = PyInterpreterStatePtr
         interp_head_addr = PtrTo(
-            PyInterpreterStatePtr
+            PyInterpreterStatePtr._customized(self._customization_dict)
         ).from_user_value(interp_head_addr, self._mem)
         interp_head = interp_head_addr.deref()
         self._interp_head = interp_head
@@ -404,25 +579,29 @@ class Python(object):
 
     @property
     def interp_state(self):
-        return self.interp_head.deref()
+        return self.interp_head.deref_boxed()
 
     @property
     def interp_states(self):
-        raise NotImplementedError
+        ptr = self.interp_head
+        while ptr:
+            interp_state = ptr.deref_boxed()
+            yield interp_state
+            ptr = interp_state.next
 
     @property
     def gc_generations(self):
         if self._gc_generations is not None:
             return self._gc_generations
         generations_addr_addr = get_symbol(self._pid, '_PyGC_generation0')
-        generations_arr = PtrTo(PtrTo(GC_generations_array)).from_user_value(
+        generations_arr = PtrTo(PtrTo(GC_generations_array._customized(self._customization_dict))).from_user_value(
             generations_addr_addr, self._mem).deref().deref()
         self._gc_generations = [generations_arr[i] for i in xrange(NUM_GENERATIONS)]
         return self._gc_generations
 
     def get_all_objects(self):
         "Return pointers to all GC tracked objects"
-        for generation in self.gc_generations:
+        for i, generation in enumerate(self.gc_generations):
             generation_head_ptr = pygc_head_ptr = generation.head.get_pointer()
             generation_head_addr = generation_head_ptr._value
             while True:
@@ -431,7 +610,7 @@ class Python(object):
                 # there is still a race condition if PyGC_Head
                 # gets free'd and overwritten just before we look
                 # at him
-                pygc_head_ptr = pygc_head_ptr.deref().gc_prev
+                pygc_head_ptr = pygc_head_ptr.deref().gc_next
                 if pygc_head_ptr._value == generation_head_addr:
                     break
                 yield pygc_head_ptr.deref().get_object_ptr()

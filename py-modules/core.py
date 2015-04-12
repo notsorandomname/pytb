@@ -6,10 +6,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 from .utils import profile
+from .inspecttools import UnreadableMemory
 
 from functools import partial
 
 class Structured(object):
+    _customization_dict = None
+
     """Chunk of memory of some (probably not constant - TODO) size that can be unpacked into some object or structure"""
     def __init__(self, addr, mem, **kwargs):
         super(Structured, self).__init__(**kwargs)
@@ -27,6 +30,8 @@ class Structured(object):
         return (type(self), self._addr, self._mem)
 
     def cast_to(self, another_type):
+        if self._customization_dict is not None:
+            another_type = another_type._customized(self._customization_dict)
         return another_type(self.get_addr(), self._mem)
 
     def get_pointer(self):
@@ -56,6 +61,15 @@ class Structured(object):
             props.append('value=%s' % (value_repr,))
         return '%s(%s)' % (self.__class__.__name__, ', '.join(props))
 
+    # XXX: Need more consistent customization API/realization
+
+    @classmethod
+    def _customized(cls, customization_dict):
+        raise NotImplementedError
+
+    @classmethod
+    def _customized_from_kwargs(cls, **kwargs):
+        return cls._customized(kwargs)
 
 class Primitive(Structured):
     """Single primitive object unpacked by struct.unpack"""
@@ -100,7 +114,6 @@ class Primitive(Structured):
     def __iadd__(self, other):
         raise NotImplementedError
 
-
     @classmethod
     def get_size(cls):
         return struct.calcsize(cls.format)
@@ -117,6 +130,11 @@ class Primitive(Structured):
         addr = self._addr
         val = self._mem.read(addr, addr + size)
         return struct.unpack(self.format, val)[0]
+
+    @classmethod
+    def _customized(cls, customization_dict):
+        # XXX: Correct base for customization!
+        return cls
 
 def create_Primitive(name, format):
     return type(name, (Primitive,), {'format': format})
@@ -138,12 +156,25 @@ class CompoundMeta(abc.ABCMeta):
 def field_getter(field_type, offset, compound_obj):
     return field_type(compound_obj._addr + offset, compound_obj._mem)
 
+customization_cache = {}
+
 class Compound(Structured, collections.Mapping):
     __metaclass__ = CompoundMeta
     def __init__(self, *args, **kwargs):
         if not self._init_done:
             self._lazy_init()
         super(Compound, self).__init__(*args, **kwargs)
+
+    # XXX: Pretty raw idea, needs rethinking
+    @classmethod
+    def _customized(cls, customization_dict):
+        cache_key = (cls, tuple(sorted(customization_dict.items())))
+        if cache_key not in customization_cache:
+            new_class_name = cls.__name__ + '_customized'
+            new_type = type(new_class_name, (cls,), customization_dict)
+            new_type._customization_dict = customization_dict
+            customization_cache[cache_key] = new_type
+        return customization_cache[cache_key]
 
     @classmethod
     def get_size(cls):
@@ -156,9 +187,15 @@ class Compound(Structured, collections.Mapping):
         getters = collections.OrderedDict()
         offsets = collections.OrderedDict()
         offset = 0
-        for field_name, field_type in cls.get_fields():
-            offsets[field_name] = offset
-            getters[field_name] = partial(field_getter, field_type, offset)
+        for tpl in cls.get_fields():
+            if not tpl:
+                continue
+            field_name, field_type = tpl
+            if cls._customization_dict is not None:
+                field_type = field_type._customized(cls._customization_dict)
+            if field_name is not None:
+                offsets[field_name] = offset
+                getters[field_name] = partial(field_getter, field_type, offset)
             offset += field_type.get_size()
         cls._computed_size = offset
         cls._fields_getters = getters
@@ -219,16 +256,23 @@ def ArrayOf(value_type, size):
 def Stub(size):
     return [None, ArrayOf(Char, size)]
 
-def PtrTo(value_type, cache={}):
+def PtrTo(value_type):
+    cache = PtrTo._cache
     if value_type not in cache:
         cache[value_type] = type(
             value_type.__name__ + 'Ptr',
             (Ptr,), dict(value_type=value_type)
         )
     return cache[value_type]
+PtrTo._cache = {}
+
 
 class Ptr(ULong):
     value_type = None
+
+    @classmethod
+    def _customized(cls, customization_dict):
+        return PtrTo(cls.value_type._customized(customization_dict))
 
     @property
     def _ptr(self):
@@ -283,17 +327,18 @@ class Ptr(ULong):
 class VoidPtrDereference(Exception):
     """Someone tried to dereference a void pointer"""
 
-class VoidPtr(Ptr):
+class VoidPtr(PtrTo(Char)):
     def deref_boxed(self, *args, **kwargs):
         raise VoidPtrDereference(self)
 
-class CharPtr(Ptr):
-    value_type = Char
+class CharPtr(PtrTo(Char)):
     def get_slice(self, start, stop):
         return ''.join(super(CharPtr, self).get_slice(start, stop))
 
     def get_null_terminated(self):
         addr = self._value
         return self._mem.get_null_terminated(addr)
+
+PtrTo._cache[Char] = CharPtr
 
 ULongPtr = PtrTo(ULong)

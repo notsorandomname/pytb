@@ -83,11 +83,13 @@ class MemReader(object):
             try:
                 chunk = self._read(buf_size)
             except UnreadableMemory:
+                # Roll back to smaller buffer size
                 if buf_size == 1:
                     raise
                 else:
                     buf_size = max(1, buf_size / 2)
                     self._seek(position)
+                    continue
             else:
                 position += buf_size
             try:
@@ -147,3 +149,6 @@ def get_symbol(pid, symbol):
             offset += mapping.start
         return offset
     raise SymbolNotFound(symbol)
+
+def get_proc_cwd(pid):
+    return os.readlink('/proc/%d/cwd' % pid)
