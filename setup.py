@@ -16,7 +16,7 @@ packages = {
 
 setup(
     name="pytb",
-    version="0.0.4",
+    version="0.0.5",
     author="mitmeedle",
     author_email="mitmeedle@gmail.com",
     entry_points={
