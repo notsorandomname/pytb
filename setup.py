@@ -2,6 +2,13 @@
 from setuptools import setup
 from setuptools.extension import Extension
 
+try:
+   import pypandoc
+   description = pypandoc.convert('README.md', 'rst')
+except (IOError, ImportError):
+   description = open('README.md').read()
+   raise
+
 packages = {
     'pytb': 'py-modules/',
     'pytb.scripts': 'py-modules/scripts'
@@ -9,7 +16,7 @@ packages = {
 
 setup(
     name="pytb",
-    version="0.0.1",
+    version="0.0.4",
     author="mitmeedle",
     author_email="mitmeedle@gmail.com",
     entry_points={
@@ -19,4 +26,5 @@ setup(
     },
     packages=packages,
     package_dir=packages,
+    long_description=description
 )
