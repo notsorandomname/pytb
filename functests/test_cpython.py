@@ -35,10 +35,17 @@ def have_a_sleep(notify=False, to_thread_local=None):
     threading.local().some_val = to_thread_local
     return have(a_sleep, notify=notify)
 class Dummy(object): pass
+
+try:
+    chr = unichr
+except NameError:
+    pass
 objects = {
     'make_dict_gc_trackable': Dummy,
     'this_is_object_dict': True,
     'simple_string': 'simple_string',
+    'simple_unicode_string': u'simple_unicode_string',
+    'unicode_string': u'unicode_string' + chr(1234),
 }
 assert gc.is_tracked(objects)
 
@@ -199,3 +206,14 @@ def objects_dict(sample_py):
 
 def test_objects_dict_string(objects_dict):
     assert objects_dict['simple_string'] == 'simple_string'
+
+def test_objects_simple_unicode_string(objects_dict):
+    unicode_string = objects_dict['simple_unicode_string']
+    assert isinstance(unicode_string, unicode)
+    assert unicode_string == u'simple_unicode_string'
+
+def test_objects_unicode_string(objects_dict):
+    unicode_string = objects_dict['unicode_string']
+    assert isinstance(unicode_string, unicode)
+    assert unicode_string == u'unicode_string' + unichr(1234)
+

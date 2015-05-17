@@ -396,3 +396,5 @@ class CharPtr(PtrTo(Char)):
 PtrTo._cache[Char] = CharPtr
 
 ULongPtr = PtrTo(ULong)
+
+IntPtr = PtrTo(Int)

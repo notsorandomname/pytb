@@ -7,7 +7,7 @@ import contextlib
 from voodoo.utils import profile, cmd_as_file
 from voodoo.core import (
     Compound, PtrTo, ArrayOf, Stub, CharPtr, Char,
-    Int, Long, ULong, VoidPtr, UInt
+    Int, Long, ULong, VoidPtr, UInt, IntPtr
 )
 
 from inspecttools import MemReader, read_proc_maps, get_symbol, SymbolNotFound
@@ -144,9 +144,11 @@ class PyObjectBase(Compound):
         result = self
         if tp_name == 'str':
             if self.py3k:
-                result = self.cast_to(PyUnicodeObject).to_string()
+                result = unicode(self.cast_to(PyUnicodeObject).to_string())
             else:
                 result = self.cast_to(PyStringObject).to_string()
+        elif tp_name == 'unicode':
+            result = self.cast_to(PyUnicodeObject).to_string()
         elif tp_name == 'bytes':
             result = self.cast_to(PyStringObject).to_string()
         elif tp_name == 'dict':
@@ -305,7 +307,7 @@ class PyUnicodeObject(PyCompactUnicodeObject):
         else:
             return PyObjectBase._customized(cls._customization_dict).get_fields() + [
                 ['length', ULong],
-                ['str', VoidPtr],
+                ['str', IntPtr],
                 ['hash', Long],
                 ['defenc', PyObjectBasePtr],
             ]
@@ -323,6 +325,15 @@ class PyUnicodeObject(PyCompactUnicodeObject):
         return super_name
 
     def to_string(self):
+        if self.py3k:
+            return self.to_string_v3()
+        else:
+            return self.to_string_v2()
+
+    def to_string_v2(self):
+        return unicode(''.join(unichr(x) for x in self.str[:self.length]))
+
+    def to_string_v3(self):
         # XXX: Legacy strings?
         state = self.state
         interned = state & 0b11
