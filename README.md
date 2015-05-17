@@ -1,7 +1,13 @@
 # pytb
 Utility for inspecting python stack of running process (x64 linux only)
 
+Installation:
+---
+
+```pip install pytb```
+
 Usage:
+---
 
 ```sudo pytb [pid]```
 
@@ -14,6 +20,8 @@ If you want to also see greenlet stacktraces, use
 this will also show you greenlets stacktraces.
 NOTE: in order to find all greenlets pytb looks for all gc tracked objects, so this may take a while if you have lots of objects.
 
+Notes:
+---
 Supports viewing python2 and python3 tracebacks (it will try to guess, whether it's 2 or 3, however you can help it by specifying -2 or -3 option)
 
 The utility works by reading ```/proc/<pid>/mem``` (this is why sudo is needed). It uses *nm* and *objdump*
