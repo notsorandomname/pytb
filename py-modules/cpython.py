@@ -212,8 +212,8 @@ class PyFrameObject(PyVarObject):
         filename = os.path.join(scriptdir, co_filename)
         lineno = self.get_lineno()
         line = linecache.getline(filename, lineno)
-        return '%s:%s(%d)\n%s' % (
-            filename, co_name, lineno, line
+        return '%s:%s(%d)\n\t%s\n' % (
+            filename, co_name, lineno, line.strip()
         )
 
     @staticmethod
@@ -757,6 +757,12 @@ class Python(object):
                 if pygc_head_ptr._value == generation_head_addr:
                     break
                 yield pygc_head_ptr.deref().get_object_ptr()
+
+    def get_greenlets(self):
+        for obj_ptr in self.get_all_objects():
+            obj = obj_ptr.deref_boxed()
+            if obj.isinstance('greenlet.greenlet'):
+                yield obj.cast_to(PyGreenlet)
 
     def get_interp_head_addr_through_symbol(self):
         return get_symbol(self._pid, 'interp_head')

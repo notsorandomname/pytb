@@ -43,11 +43,8 @@ def main():
                 print ''.join(frame.format_stack(scriptdir=scriptdir))
 
         if args.greenlets:
-            for obj_ptr in py.get_all_objects():
-                obj = obj_ptr.deref_boxed()
-                if obj.isinstance('greenlet.greenlet'):
-                    gr = obj.cast_to(PyGreenlet)
-                    top_frame = gr.top_frame.deref_boxed()
-                    if top_frame._addr:
-                        print "### Another greenlet"
-                        print ''.join(top_frame.format_stack(scriptdir=scriptdir))
+            for gr in py.get_greenlets():
+                top_frame = gr.top_frame.deref_boxed()
+                if top_frame._addr:
+                    print "### Another greenlet"
+                    print ''.join(top_frame.format_stack(scriptdir=scriptdir))

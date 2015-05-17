@@ -7,12 +7,29 @@ import os
 import sys
 import tempfile
 import shutil
-from mock import MagicMock
 import subprocess
 from voodoo.core import Compound
 import voodoo.cpython
 from voodoo.cpython import Python, PyDictObject
 from voodoo.inspecttools import SimpleGdbExecutor, StructHelper
+
+@pytest.fixture(scope='module')
+def greenlet_program_code():
+    return textwrap.dedent("""
+    import gevent, sys, os
+    def loop_forever(interval, notify=False):
+        if notify:
+            sys.stdout.write('ready')
+            fileno = sys.stdout.fileno()
+            sys.stdout.close()
+            # closing sys.stdout only marks as closed
+            os.close(fileno)
+        while True:
+            gevent.sleep(interval)
+    gevent.spawn(loop_forever, 1)
+    gevent.spawn(loop_forever, 1)
+    loop_forever(1, notify=True)
+""")
 
 @pytest.fixture(scope='module')
 def sample_program_code():
@@ -34,18 +51,21 @@ def have(what, notify):
 def have_a_sleep(notify=False, to_thread_local=None):
     threading.local().some_val = to_thread_local
     return have(a_sleep, notify=notify)
-class Dummy(object): pass
 
 try:
     chr = unichr
 except NameError:
     pass
+
+class Dummy(object): pass
+
 objects = {
     'make_dict_gc_trackable': Dummy,
     'this_is_object_dict': True,
     'simple_string': 'simple_string',
     'simple_unicode_string': u'simple_unicode_string',
     'unicode_string': u'unicode_string' + chr(1234),
+    'simple_dict': {'key': 'value'},
 }
 assert gc.is_tracked(objects)
 
@@ -72,14 +92,34 @@ def module_tmpdir():
         if directory is not None:
             shutil.rmtree(directory)
 
+@contextlib.contextmanager
+def get_sample_program(program_code, cmd):
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(program_code)
+        f.flush()
+        with subprocess_ctx(cmd + [f.name], stdout=subprocess.PIPE) as p:
+            yield p
+
 @pytest.yield_fixture(scope='module')
-def sample_program(module_tmpdir, sample_program_code, python_cmd, py3k):
-    path = os.path.join(module_tmpdir, 'sample_program.py')
-    with open(path, 'wb') as f:
-        f.write(sample_program_code)
-    with subprocess_ctx(python_cmd + [path], stdout=subprocess.PIPE) as p:
+def sample_program(sample_program_code, python_cmd):
+    with get_sample_program(sample_program_code, python_cmd) as p:
         assert p.stdout.read() == 'ready'
         yield p
+
+@pytest.yield_fixture(scope='module')
+def sample_greenlet_program(greenlet_program_code, python_cmd, py3k):
+    if py3k:
+        pytest.skip("Greenlets not supported on Python 3 yet")
+
+    p = subprocess.Popen(python_cmd + ['-c', 'import gevent'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+    if p.wait() != 0:
+        pytest.skip("No gevent found: %s" % ((stdout + '\n' + stderr).strip()))
+
+    with get_sample_program(greenlet_program_code, python_cmd) as p:
+        assert p.stdout.read() == 'ready'
+        yield p
+
 
 @contextlib.contextmanager
 def get_gdb_executor(request, py3k):
@@ -114,6 +154,11 @@ def struct_helper(request, py3k):
 @pytest.yield_fixture(scope='module')
 def sample_py(sample_program, py3k, struct_helper):
     with Python(sample_program.pid, py3k=py3k, struct_helper=struct_helper) as py:
+        yield py
+
+@pytest.yield_fixture(scope='module')
+def sample_greenlet_py(sample_greenlet_program, py3k, struct_helper):
+    with Python(sample_greenlet_program.pid, py3k=py3k, struct_helper=struct_helper) as py:
         yield py
 
 @contextlib.contextmanager
@@ -217,3 +262,60 @@ def test_objects_unicode_string(objects_dict):
     assert isinstance(unicode_string, unicode)
     assert unicode_string == u'unicode_string' + unichr(1234)
 
+def test_objects_dict(objects_dict):
+    assert objects_dict['simple_dict'] == {'key': 'value'}
+
+def test_stacktrace(sample_py):
+    threads = list(sample_py.interp_state.get_thread_states())
+    stacks  = [''.join(thread.frame.deref().format_stack(scriptdir=os.getcwd())) for thread in threads]
+    for stack in stacks:
+        assert 'return what(notify)' in stack
+    main_stack = stacks[-1]
+    thread1_stack, thread2_stack = stacks[:-1]
+    assert "have_a_sleep(notify=True, to_thread_local='main')" in main_stack
+    for stack in [thread1_stack, thread2_stack]:
+        assert 'threading.py' in stack
+
+def test_greenlets_get(sample_greenlet_py):
+    # 3 greenlets + hub
+    assert len(list(sample_greenlet_py.get_greenlets())) == 4
+
+def test_greenlets_stacktrace(sample_greenlet_py):
+    has_main_greenlet = 0
+    has_sub_greenlet = 0
+    for gr in sample_greenlet_py.get_greenlets():
+        stacktrace = ''.join(gr.top_frame.deref_boxed().format_stack(scriptdir=os.getcwd()))
+        if 'loop_forever(1, notify=True)' in stacktrace:
+            has_main_greenlet += 1
+        if 'result = self._run(*self.args, **self.kwargs)' in stacktrace:
+            assert 'loop_forever' in stacktrace
+            has_sub_greenlet += 1
+    assert has_main_greenlet == 1
+    assert has_sub_greenlet == 2
+
+def communicate(*args, **kwargs):
+    kwargs.setdefault('stdout', subprocess.PIPE)
+    kwargs.setdefault('stderr', subprocess.PIPE)
+    p = subprocess.Popen(*args, **kwargs)
+    stdout, stderr = p.communicate()
+    output = (stdout + '\n' + stderr).strip()
+    if p.wait() != 0:
+        raise subprocess.CalledProcessError(p.wait(), args[0], output=output)
+    return stdout, stderr
+
+@pytest.fixture
+def root_privileges():
+    if os.geteuid() != 0:
+        pytest.skip("This test needs root privileges for reading proc mem")
+
+def test_launching_pystack(sample_program, root_privileges):
+    stdout, stderr = communicate(['pystack', str(sample_program.pid)])
+    assert "have_a_sleep(notify=True, to_thread_local='main')" in stdout
+    assert stdout.count("have(a_sleep, notify=notify)") == 3
+    assert not stderr
+
+def test_launching_pystack_greenlets(sample_greenlet_program, root_privileges):
+    stdout, stderr = communicate(['pystack', str(sample_greenlet_program.pid), '--greenlets'])
+    assert "loop_forever(1, notify=True)" in stdout
+    assert stdout.count("gevent.sleep(interval)") == 3
+    assert not stderr
