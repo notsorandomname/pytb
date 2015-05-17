@@ -25,6 +25,6 @@ setup(
     },
     packages=packages,
     package_dir=packages,
-    description='Utility for viewing stacktraces of running python process',
+    description='Utility for viewing stacktraces of running python processes',
     long_description=description
 )

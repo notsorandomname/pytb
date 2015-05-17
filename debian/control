@@ -9,8 +9,9 @@ Standards-Version: 3.9.1
 
 Package: python-pytb
 Architecture: all
-Depends: ${misc:Depends}, ${python:Depends}
-Description: Utility for viewing stacktraces of running python process
+Depends: ${misc:Depends}, ${python:Depends}, binutils
+Recommends: gdb
+Description: Utility for viewing stacktraces of running python processes
  pytb
  ====
  .
