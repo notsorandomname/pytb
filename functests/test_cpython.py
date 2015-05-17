@@ -157,3 +157,6 @@ def test_struct_helper_for_all_structures(request, cpython_structure, py3k):
         cpython_structure = cpython_structure._customized_from_kwargs(struct_helper=struct_helper, py3k=py3k)
         cpython_structure._lazy_init()
         assert not cpython_structure._fields_offsets_fixups
+
+def test_guessing_python_version(py3k, sample_program):
+    assert Python(sample_program.pid)._py3k == py3k

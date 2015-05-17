@@ -16,7 +16,9 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help="Show debug info")
     parser.add_argument('-g', '--greenlets', action='store_true', help="Show greenlets tracebacks. This requires traversing all objects")
     parser.add_argument('-l', '--locals', action='store_true', help="Show frame locals")
-    parser.add_argument('-3', '--py3k', action='store_true', help='Python3')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-3', '--py3k', action='store_true', help='Python3')
+    group.add_argument('-2', '--py2', action='store_true', help='Python2')
     parser.add_argument('--scriptdir', help='Script directory, python3 co_filename is relative for scripts. This defaults `pid` cwd')
     args = parser.parse_args()
     if args.verbose:
@@ -25,7 +27,13 @@ def main():
 
     scriptdir = args.scriptdir or get_proc_cwd(pid)
 
-    with Python(pid, py3k=args.py3k) as py:
+    py3k = None
+    if args.py3k:
+        py3k = True
+    elif args.py2:
+        py3k = False
+
+    with Python(pid, py3k=py3k) as py:
         for i, interp_state in enumerate(py.interp_states):
             if i != 0:
                 print "### Another interpreter state"

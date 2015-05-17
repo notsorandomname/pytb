@@ -648,8 +648,10 @@ PyGreenletPtr = PtrTo(PyGreenlet)
 
 
 class Python(object):
-    def __init__(self, pid, py3k=False, struct_helper=None):
+    def __init__(self, pid, py3k=None, struct_helper=None):
         self._pid = pid
+        if py3k is None:
+            py3k = self.guess_py3k(pid)
         self._py3k = py3k
         self._struct_helper = struct_helper
         self._reinit()
@@ -667,6 +669,16 @@ class Python(object):
         self._mem = MemReader(self._pid)
         self._mem.__enter__()
         return self
+
+    @staticmethod
+    def guess_py3k(pid):
+        """Try to guess if this is python3"""
+        try:
+            get_symbol(pid, 'PyUnicode_AsASCIIString')
+        except SymbolNotFound:
+            return False
+        else:
+            return True
 
     def __exit__(self, *args):
         result = self._mem.__exit__(*args)
