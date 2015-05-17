@@ -129,6 +129,7 @@ def test_thread_dict(sample_py):
 def pytest_generate_tests(metafunc):
     if 'cpython_structure' in metafunc.fixturenames:
         all_classes = []
+        all_names = []
         for name in dir(voodoo.cpython):
             value = getattr(voodoo.cpython, name)
             if isinstance(value, type) and issubclass(value, Compound):
@@ -136,8 +137,9 @@ def pytest_generate_tests(metafunc):
                 if cls.get_c_name() is None or not cls.use_struct_helper():
                     continue
                 all_classes.append(cls)
+                all_names.append(cls.__name__)
         metafunc.parametrize("cpython_structure_class",
-                             all_classes)
+                             all_classes, ids=all_names)
 @pytest.fixture
 def cpython_structure(cpython_structure_class, py3k):
     skip_classes = {
