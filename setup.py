@@ -8,10 +8,10 @@ packages = {
 }
 
 setup(
-    name="voodoo",
+    name="pytb",
     version="0.0.1",
-    author="xxx",
-    author_email="xxx@gmail.com",
+    author="mitmeedle",
+    author_email="mitmeedle@gmail.com",
     entry_points={
         'console_scripts': [
             'pystack = voodoo.scripts.pystack:main',
