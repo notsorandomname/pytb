@@ -3,7 +3,10 @@ import pytest
 import signal
 import textwrap
 import contextlib
+import os
 import sys
+import tempfile
+import shutil
 from mock import MagicMock
 import subprocess
 from voodoo.core import Compound
@@ -11,10 +14,10 @@ import voodoo.cpython
 from voodoo.cpython import Python, PyDictObject
 from voodoo.inspecttools import SimpleGdbExecutor, StructHelper
 
-@pytest.fixture
+@pytest.fixture(scope='module')
 def sample_program_code():
     return textwrap.dedent("""
-import time, sys, os
+import time, sys, os, threading, gc
 def a_sleep(notify):
     if notify:
         sys.stdout.write('ready')
@@ -31,24 +34,40 @@ def have(what, notify):
 def have_a_sleep(notify=False, to_thread_local=None):
     threading.local().some_val = to_thread_local
     return have(a_sleep, notify=notify)
+class Dummy(object): pass
+objects = {
+    'make_dict_gc_trackable': Dummy,
+    'this_is_object_dict': True,
+    'simple_string': 'simple_string',
+}
+assert gc.is_tracked(objects)
 
-import threading
 threading.Thread(target=have_a_sleep, kwargs=dict(to_thread_local='t1')).start()
 threading.Thread(target=have_a_sleep, kwargs=dict(to_thread_local='t1')).start()
 have_a_sleep(notify=True, to_thread_local='main')
     """).strip()
 
-@pytest.fixture(params=['py3k', 'py2'])
+@pytest.fixture(params=['py2', 'py3k'], scope='module')
 def py3k(request):
     return request.param == 'py3k'
 
-@pytest.fixture
+@pytest.fixture(scope='module')
 def python_cmd(py3k):
     return ['python3' if py3k else 'python']
 
-@pytest.yield_fixture
-def sample_program(tmpdir, sample_program_code, python_cmd, py3k):
-    path = tmpdir.join('sample_program.py').strpath
+@pytest.yield_fixture(scope='module')
+def module_tmpdir():
+    directory = None
+    try:
+        directory = tempfile.mkdtemp()
+        yield directory
+    finally:
+        if directory is not None:
+            shutil.rmtree(directory)
+
+@pytest.yield_fixture(scope='module')
+def sample_program(module_tmpdir, sample_program_code, python_cmd, py3k):
+    path = os.path.join(module_tmpdir, 'sample_program.py')
     with open(path, 'wb') as f:
         f.write(sample_program_code)
     with subprocess_ctx(python_cmd + [path], stdout=subprocess.PIPE) as p:
@@ -77,7 +96,7 @@ def get_struct_helper(request, py3k):
     with get_gdb_executor(request, py3k) as gdb_executor:
         yield StructHelper(gdb_executor)
 
-@pytest.yield_fixture(params=['struct_helper', 'no_helper'])
+@pytest.yield_fixture(params=['struct_helper', 'no_helper'], scope='module')
 def struct_helper(request, py3k):
     if request.param == 'no_helper':
         yield None
@@ -85,7 +104,7 @@ def struct_helper(request, py3k):
         with get_struct_helper(request, py3k) as struct_helper:
             yield struct_helper
 
-@pytest.yield_fixture
+@pytest.yield_fixture(scope='module')
 def sample_py(sample_program, py3k, struct_helper):
     with Python(sample_program.pid, py3k=py3k, struct_helper=struct_helper) as py:
         yield py
@@ -165,3 +184,18 @@ def test_guessing_python_version(py3k, sample_program):
 
 def test_gc_listing_all_objects(sample_py):
     assert list(sample_py.get_all_objects())
+
+@pytest.fixture(scope='module')
+def objects_dict(sample_py):
+    for obj in sample_py.get_all_objects():
+        obj = obj.deref_boxed()
+        if not obj.isinstance('dict'):
+            continue
+        obj = obj.as_python_value()
+        if 'this_is_object_dict' in obj:
+            return obj
+    else:
+        raise ValueError("object dict not found")
+
+def test_objects_dict_string(objects_dict):
+    assert objects_dict['simple_string'] == 'simple_string'
