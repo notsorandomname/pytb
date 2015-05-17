@@ -17,21 +17,21 @@ Description: Utility for viewing stacktraces of running python processes
  .
  Utility for inspecting python stack of running process (x64 linux only)
  .
- Usage:
+ Features:
+ ---------
  .
- ``sudo pytb [pid]``
+ -  Python3 friendly (pytb itself requires python2 to run, but process
+    being analyzed can be python3)
+ -  Greenlet (gevent) friendly, can show stacktrace for each greenlet
+ -  Works by just reading ``/proc/<pid>/mem``, so doesn't need to attach
+    to target process (e.g. if you don't want to stop the target process,
+    or are debugging an unattachable process, like a D-state process)
  .
- will show you stacktrace of each python thread.
+ Bugs:
+ -----
  .
- If you want to also see greenlet stacktraces, use
+ -  Linux only, 64-bit only.
  .
- ``sudo pytb -g [pid]``
- .
- this will also show you greenlets stacktraces. NOTE: in order to find
- all greenlets pytb looks for all gc tracked objects, so this may take a
- while if you have lots of objects.
- .
- Supports viewing python2 and python3 tracebacks (it will try to guess,
 
 
 
