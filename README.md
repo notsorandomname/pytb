@@ -1,6 +1,16 @@
 # pytb
 Utility for inspecting python stack of running process (x64 linux only)
 
+Features:
+---
+- Python3 friendly (pytb itself requires python2 to run, but process being analyzed can be python3)
+- Greenlet (gevent) friendly, can show stacktrace for each greenlet
+- Works by just reading ```/proc/<pid>/mem```, so doesn't need to attach to target process (e.g. if you don't want to stop the target process, or are debugging an unattachable process, like a D-state process)
+
+Bugs:
+---
+- Linux only, 64-bit only.
+
 Installation:
 ---
 
