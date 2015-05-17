@@ -3,8 +3,8 @@ from setuptools import setup
 from setuptools.extension import Extension
 
 packages = {
-    'voodoo': 'py-modules/',
-    'voodoo.scripts': 'py-modules/scripts'
+    'pytb': 'py-modules/',
+    'pytb.scripts': 'py-modules/scripts'
 }
 
 setup(
@@ -14,7 +14,7 @@ setup(
     author_email="mitmeedle@gmail.com",
     entry_points={
         'console_scripts': [
-            'pystack = voodoo.scripts.pystack:main',
+            'pytb = pytb.scripts.pytb:main',
         ]
     },
     packages=packages,

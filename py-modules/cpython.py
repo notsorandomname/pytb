@@ -4,8 +4,8 @@ import os
 import linecache
 import subprocess
 import contextlib
-from voodoo.utils import profile, cmd_as_file
-from voodoo.core import (
+from pytb.utils import profile, cmd_as_file
+from pytb.core import (
     Compound, PtrTo, ArrayOf, Stub, CharPtr, Char,
     Int, Long, ULong, VoidPtr, UInt, IntPtr
 )
@@ -13,7 +13,7 @@ from voodoo.core import (
 from inspecttools import MemReader, read_proc_maps, get_symbol, SymbolNotFound
 
 import logging
-logger = logging.getLogger('voodoo.cpython')
+logger = logging.getLogger('pytb.cpython')
 
 
 class PyInterpreterState(Compound):

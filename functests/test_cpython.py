@@ -8,10 +8,10 @@ import sys
 import tempfile
 import shutil
 import subprocess
-from voodoo.core import Compound
-import voodoo.cpython
-from voodoo.cpython import Python, PyDictObject
-from voodoo.inspecttools import SimpleGdbExecutor, StructHelper
+from pytb.core import Compound
+import pytb.cpython
+from pytb.cpython import Python, PyDictObject
+from pytb.inspecttools import SimpleGdbExecutor, StructHelper
 
 @pytest.fixture(scope='module')
 def greenlet_program_code():
@@ -202,8 +202,8 @@ def pytest_generate_tests(metafunc):
     if 'cpython_structure' in metafunc.fixturenames:
         all_classes = []
         all_names = []
-        for name in dir(voodoo.cpython):
-            value = getattr(voodoo.cpython, name)
+        for name in dir(pytb.cpython):
+            value = getattr(pytb.cpython, name)
             if isinstance(value, type) and issubclass(value, Compound):
                 cls = value
                 if cls.get_c_name() is None or not cls.use_struct_helper():
@@ -314,14 +314,14 @@ def struct_helper_params(py3k, request):
     executable = get_dbg_executable(py3k, request)
     return ['--debug-executable', executable]
 
-def test_launching_pystack(sample_program, root_privileges, struct_helper_params):
-    stdout, stderr = communicate(['pystack', str(sample_program.pid)] + struct_helper_params)
+def test_launching_pytb(sample_program, root_privileges, struct_helper_params):
+    stdout, stderr = communicate(['pytb', str(sample_program.pid)] + struct_helper_params)
     assert "have_a_sleep(notify=True, to_thread_local='main')" in stdout
     assert stdout.count("have(a_sleep, notify=notify)") == 3
     assert not stderr
 
-def test_launching_pystack_greenlets(sample_greenlet_program, root_privileges, struct_helper_params):
-    stdout, stderr = communicate(['pystack', str(sample_greenlet_program.pid), '--greenlets'] + struct_helper_params)
+def test_launching_pytb_greenlets(sample_greenlet_program, root_privileges, struct_helper_params):
+    stdout, stderr = communicate(['pytb', str(sample_greenlet_program.pid), '--greenlets'] + struct_helper_params)
     assert "loop_forever(1, notify=True)" in stdout
     assert stdout.count("gevent.sleep(interval)") == 3
     assert not stderr
