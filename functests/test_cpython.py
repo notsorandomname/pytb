@@ -162,3 +162,6 @@ def test_struct_helper_for_all_structures(request, cpython_structure, py3k):
 
 def test_guessing_python_version(py3k, sample_program):
     assert Python(sample_program.pid)._py3k == py3k
+
+def test_gc_listing_all_objects(sample_py):
+    assert list(sample_py.get_all_objects())

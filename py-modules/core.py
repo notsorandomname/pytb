@@ -226,8 +226,8 @@ class Compound(Structured, collections.Mapping):
             if cls._customization_dict is not None:
                 field_type = field_type._customized(cls._customization_dict)
                 if field_name is not None and struct_helper is not None and type_name is not None:
-                    field_name = cls.get_c_field_name(field_name)
-                    proposed_offset = struct_helper.offset_of(type_name, field_name)
+                    c_field_name = cls.get_c_field_name(field_name)
+                    proposed_offset = struct_helper.offset_of(type_name, c_field_name)
                     if proposed_offset is not None:
                         if offset != proposed_offset:
                             cls._fields_offsets_fixups[field_name] = (offset, proposed_offset)
