@@ -27,8 +27,6 @@ def main():
 
     with Python(pid, py3k=args.py3k) as py:
         for i, interp_state in enumerate(py.interp_states):
-            from ..cpython import PyModuleObject
-            print dict(interp_state.modules.deref())['__main__'].cast_to(PyModuleObject).md_dict.deref()
             if i != 0:
                 print "### Another interpreter state"
             for thread_state in interp_state.get_thread_states():

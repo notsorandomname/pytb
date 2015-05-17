@@ -11,13 +11,29 @@ from .inspecttools import UnreadableMemory
 from functools import partial
 
 class Structured(object):
+    @classmethod
+    def use_struct_helper(cls):
+        return True
     _customization_dict = None
+    _customization_base = None
+
+    @classmethod
+    def _get_customization_base(cls):
+        return cls.__dict__.get('_customization_base', cls)
 
     """Chunk of memory of some (probably not constant - TODO) size that can be unpacked into some object or structure"""
     def __init__(self, addr, mem, **kwargs):
         super(Structured, self).__init__(**kwargs)
         self._addr = addr
         self._mem = mem
+
+    @classmethod
+    def get_c_name(cls):
+        return cls._get_customization_base().__name__
+
+    @classmethod
+    def get_c_field_name(cls, field):
+        return field
 
     @classmethod
     def get_size(cls):
@@ -124,6 +140,11 @@ class Primitive(Structured):
     def __nonzero__(self):
         return bool(self._value)
 
+    def __eq__(self, other):
+        if isinstance(other, Primitive):
+            other = other._value
+        return self._value == other
+
     @profile
     def read_from_mem(self):
         size = self.get_size()
@@ -150,6 +171,7 @@ class CompoundMeta(abc.ABCMeta):
         super(CompoundMeta, cls).__init__(name, bases, dct)
         cls._fields_getters = None
         cls._fields_offsets = None
+        cls._fields_offsets_fixups = collections.OrderedDict()
         cls._computed_size = None
         cls._init_done = False
 
@@ -173,8 +195,13 @@ class Compound(Structured, collections.Mapping):
             new_class_name = cls.__name__ + '_customized'
             new_type = type(new_class_name, (cls,), customization_dict)
             new_type._customization_dict = customization_dict
+            new_type._customization_base = cls._get_customization_base()
             customization_cache[cache_key] = new_type
         return customization_cache[cache_key]
+
+    @classmethod
+    def use_struct_helper(cls):
+        return cls._customization_base is not Compound
 
     @classmethod
     def get_size(cls):
@@ -187,17 +214,35 @@ class Compound(Structured, collections.Mapping):
         getters = collections.OrderedDict()
         offsets = collections.OrderedDict()
         offset = 0
+        struct_helper = None
+        if cls.use_struct_helper():
+            if cls._customization_dict is not None:
+                struct_helper = cls._customization_dict.get('struct_helper')
+        type_name = cls.get_c_name()
         for tpl in cls.get_fields():
             if not tpl:
                 continue
             field_name, field_type = tpl
             if cls._customization_dict is not None:
                 field_type = field_type._customized(cls._customization_dict)
+                if field_name is not None and struct_helper is not None and type_name is not None:
+                    field_name = cls.get_c_field_name(field_name)
+                    proposed_offset = struct_helper.offset_of(type_name, field_name)
+                    if proposed_offset is not None:
+                        if offset != proposed_offset:
+                            cls._fields_offsets_fixups[field_name] = (offset, proposed_offset)
+                            logger.warning("Offset of %s of struct %s don't match, real offset %d, while we have %d", field_name, cls, proposed_offset, offset)
+                        offset = proposed_offset
             if field_name is not None:
                 offsets[field_name] = offset
                 getters[field_name] = partial(field_getter, field_type, offset)
             offset += field_type.get_size()
-        cls._computed_size = offset
+        size = offset
+        if struct_helper is not None:
+            sizeof_result = struct_helper.sizeof(type_name)
+            if sizeof_result is not None:
+                size = sizeof_result
+        cls._computed_size = size
         cls._fields_getters = getters
         cls._fields_offsets = offsets
         cls._init_done = True
@@ -235,6 +280,10 @@ class Compound(Structured, collections.Mapping):
         return cls._fields_offsets[name]
 
 class Array(Compound):
+    @classmethod
+    def use_struct_helper(cls):
+        return False
+
     value_type = None
     size = 0
     @classmethod

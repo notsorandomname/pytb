@@ -2,6 +2,7 @@
 import collections
 import logging
 import os
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -152,3 +153,52 @@ def get_symbol(pid, symbol):
 
 def get_proc_cwd(pid):
     return os.readlink('/proc/%d/cwd' % pid)
+
+class StructHelper(object):
+    def __init__(self, gdb_executor):
+        self.gdb_executor = gdb_executor
+
+    def offset_of(self, struct, field):
+        return int(self.gdb_executor.evaluate("""
+            (int)&(({struct}*)0)->{field}
+        """.format(struct=struct, field=field)))
+
+    def sizeof(self, name):
+        return int(self.gdb_executor.evaluate(
+            'sizeof({name})'.format(name=name)
+        ))
+
+class GDBMIError(Exception):
+    pass
+
+class SimpleGdbExecutor(object):
+    def __init__(self, cmd):
+        self.cmd = cmd
+        self.process = None
+
+    def __enter__(self):
+        with open(os.devnull, 'wb') as devnull:
+            self.process = subprocess.Popen(
+                ['gdb', '--interpreter', 'mi', '--args'] + self.cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=devnull)
+        return self
+
+    def __exit__(self, tp, val, tb):
+        self.process.kill()
+        self.process.wait()
+
+    def evaluate(self, expr):
+        expr = expr.strip()
+        self.process.stdin.write(("""
+            1-data-evaluate-expression %s
+        """ % expr).strip())
+        self.process.stdin.write('\n')
+        self.process.stdin.flush()
+        while True:
+            result = self.process.stdout.readline().strip()
+            if result.startswith('1^'):
+                break
+        if not result.startswith('1^done'):
+            raise GDBMIError(expr, result)
+        return result.partition('value=')[-1].strip('"')
