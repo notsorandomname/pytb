@@ -120,22 +120,23 @@ def sample_greenlet_program(greenlet_program_code, python_cmd, py3k):
         assert p.stdout.read() == 'ready'
         yield p
 
+def get_dbg_executable(py3k, request):
+    if py3k:
+        dbg_executable = request.config.getoption('--python3-dbg')
+    else:
+        dbg_executable = request.config.getoption('--python2-dbg')
+    try:
+        p = subprocess.Popen([dbg_executable, '-c', ''])
+    except OSError, ex:
+        pytest.skip("while trying to launch %s: %s" % (dbg_executable, ex))
+    else:
+        p.kill()
+    return dbg_executable
 
 @contextlib.contextmanager
 def get_gdb_executor(request, py3k):
-    if py3k:
-        executable = request.config.getoption('--python3-dbg')
-    else:
-        executable = request.config.getoption('--python2-dbg')
-
-    try:
-        p = subprocess.Popen([executable, '-c', ''])
-    except OSError, ex:
-        pytest.skip("while trying to launch %s: %s" % (executable, ex))
-    else:
-        p.kill()
-
-    with SimpleGdbExecutor([executable]) as sge:
+    dbg_executable = get_dbg_executable(py3k, request)
+    with SimpleGdbExecutor([dbg_executable]) as sge:
         yield sge
 
 @contextlib.contextmanager
@@ -308,14 +309,19 @@ def root_privileges():
     if os.geteuid() != 0:
         pytest.skip("This test needs root privileges for reading proc mem")
 
-def test_launching_pystack(sample_program, root_privileges):
-    stdout, stderr = communicate(['pystack', str(sample_program.pid)])
+@pytest.fixture
+def struct_helper_params(py3k, request):
+    executable = get_dbg_executable(py3k, request)
+    return ['--debug-executable', executable]
+
+def test_launching_pystack(sample_program, root_privileges, struct_helper_params):
+    stdout, stderr = communicate(['pystack', str(sample_program.pid)] + struct_helper_params)
     assert "have_a_sleep(notify=True, to_thread_local='main')" in stdout
     assert stdout.count("have(a_sleep, notify=notify)") == 3
     assert not stderr
 
-def test_launching_pystack_greenlets(sample_greenlet_program, root_privileges):
-    stdout, stderr = communicate(['pystack', str(sample_greenlet_program.pid), '--greenlets'])
+def test_launching_pystack_greenlets(sample_greenlet_program, root_privileges, struct_helper_params):
+    stdout, stderr = communicate(['pystack', str(sample_greenlet_program.pid), '--greenlets'] + struct_helper_params)
     assert "loop_forever(1, notify=True)" in stdout
     assert stdout.count("gevent.sleep(interval)") == 3
     assert not stderr
