@@ -323,6 +323,11 @@ class Ptr(ULong):
     def _customized(cls, customization_dict):
         return PtrTo(cls.value_type._customized(customization_dict))
 
+    def cast_to(self, another_type):
+        if self.value_type._customization_dict is not None:
+            another_type = another_type._customized(self.value_type._customization_dict)
+        return super(Ptr, self).cast_to(another_type)
+
     @property
     def _ptr(self):
         """Address where Ptr points to"""
