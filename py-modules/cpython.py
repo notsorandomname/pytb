@@ -596,7 +596,7 @@ class PyGC_Head(Compound):
         return 'gc->' + field
 
     def get_object_ptr(self):
-        return (self.get_pointer() + 1).cast_to(PyObjectBasePtr)
+        return (self.get_pointer() + 1).cast_to(PyObjectBasePtr._customized(self._customization_dict))
 
 PyGC_HeadPtr = PtrTo(PyGC_Head)
 
