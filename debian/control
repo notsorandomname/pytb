@@ -1,0 +1,36 @@
+Source: pytb
+Maintainer: mitmeedle <mitmeedle@gmail.com>
+Section: python
+Priority: optional
+Build-Depends: python-setuptools (>= 0.6b3), python-all (>= 2.6.6-3), debhelper (>= 7.4.3)
+Standards-Version: 3.9.1
+
+
+
+Package: python-pytb
+Architecture: all
+Depends: ${misc:Depends}, ${python:Depends}
+Description: Utility for viewing stacktraces of running python process
+ pytb
+ ====
+ .
+ Utility for inspecting python stack of running process (x64 linux only)
+ .
+ Usage:
+ .
+ ``sudo pytb [pid]``
+ .
+ will show you stacktrace of each python thread.
+ .
+ If you want to also see greenlet stacktraces, use
+ .
+ ``sudo pytb -g [pid]``
+ .
+ this will also show you greenlets stacktraces. NOTE: in order to find
+ all greenlets pytb looks for all gc tracked objects, so this may take a
+ while if you have lots of objects.
+ .
+ Supports viewing python2 and python3 tracebacks (it will try to guess,
+
+
+
