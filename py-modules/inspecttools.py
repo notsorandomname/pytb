@@ -52,15 +52,15 @@ class MemReader(object):
     def _seek(self, position):
         try:
             self._fh.seek(position)
-        except OverflowError:
-            raise UnreadableMemory(position)
+        except OverflowError, ex:
+            raise UnreadableMemory(position, repr(ex))
 
     def _read(self, size):
         try:
             return self._fh.read(size)
-        except IOError:
+        except IOError, ex:
             pos = self._fh.tell()
-            raise UnreadableMemory(pos, pos + size)
+            raise UnreadableMemory(pos, pos + size, repr(ex))
 
     @profile
     def read(self, start, end):
