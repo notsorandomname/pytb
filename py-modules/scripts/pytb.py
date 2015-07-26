@@ -49,9 +49,10 @@ def main():
                 if i != 0:
                     print "### Another interpreter state"
                 for thread_state in interp_state.get_thread_states():
-                    print "### Another thread"
                     frame = thread_state.get_frame()
-                    print ''.join(frame.format_stack(scriptdir=scriptdir))
+                    if frame._addr:
+                        print "### Another thread"
+                        print ''.join(frame.format_stack(scriptdir=scriptdir))
 
             if args.greenlets:
                 for gr in py.get_greenlets():
